@@ -54,6 +54,20 @@ try {
   `;
   run('node', ['-e', smoke], { cwd: scratch, stdio: 'inherit' });
 
+  // 3b. Require it the way an ESM consumer does: `import { x } from pkg`. This
+  //     exercises Node's cjs-module-lexer, which only detects named exports in
+  //     identifier/shorthand form — a `key: obj.fn` export is invisible here
+  //     even though CJS `require` sees it. Catches the ESM/CJS interop gap.
+  const esmSmoke = `
+    import * as ns from '${pkg.name}';
+    const named = ['runBackupJob', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry'];
+    const missing = named.filter((k) => typeof ns[k] !== 'function');
+    if (missing.length) { throw new Error('missing ESM named exports: ' + missing.join(', ')); }
+    console.log('[verify-pack] ESM named exports OK');
+  `;
+  writeFileSync(join(scratch, 'esm-smoke.mjs'), esmSmoke);
+  run('node', [join(scratch, 'esm-smoke.mjs')], { cwd: scratch, stdio: 'inherit' });
+
   // 4. Assert every declared bin resolves to a real, shipped file.
   for (const binRel of Object.values(pkg.bin ?? {})) {
     const binSmoke = `require.resolve('${pkg.name}/${binRel.replace(/^\.\//, '')}')`;

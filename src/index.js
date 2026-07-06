@@ -3,7 +3,19 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
-const storage = require('./storage');
+// Destructure into locals so module.exports can use shorthand keys — Node's
+// cjs-module-lexer only detects named exports for identifier/shorthand forms, so
+// `key: storage.fn` would be invisible to ESM `import { fn }` consumers.
+const {
+  MANIFEST_FILENAME,
+  expandHome,
+  isContainedWithin,
+  resolveBackupDirectories,
+  getBackupFallbackDirectory,
+  resolveContainedBackupPath,
+  readBackupManifest,
+  appendBackupManifestEntry,
+} = require('./storage');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -1025,12 +1037,12 @@ module.exports = {
   runBackupJob,
   runCli,
   // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
-  MANIFEST_FILENAME: storage.MANIFEST_FILENAME,
-  expandHome: storage.expandHome,
-  isContainedWithin: storage.isContainedWithin,
-  resolveBackupDirectories: storage.resolveBackupDirectories,
-  getBackupFallbackDirectory: storage.getBackupFallbackDirectory,
-  resolveContainedBackupPath: storage.resolveContainedBackupPath,
-  readBackupManifest: storage.readBackupManifest,
-  appendBackupManifestEntry: storage.appendBackupManifestEntry,
+  MANIFEST_FILENAME,
+  expandHome,
+  isContainedWithin,
+  resolveBackupDirectories,
+  getBackupFallbackDirectory,
+  resolveContainedBackupPath,
+  readBackupManifest,
+  appendBackupManifestEntry,
 };

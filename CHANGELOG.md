@@ -3,6 +3,14 @@
 All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.3.1
+
+- Fix ESM named imports of the storage helpers: export them as shorthand
+  identifiers so Node's cjs-module-lexer detects them. `key: storage.fn` was
+  invisible to `import { fn } from "@andrewvpopov/db-backup"` (hit by stoki/sano,
+  which run ESM). No API change.
+- verify-pack now also runs an ESM `import { ... }` smoke to catch this class.
+
 ## 0.3.0
 
 Generalizes stoki/pantry's admin backup-storage subsystem into shared,
