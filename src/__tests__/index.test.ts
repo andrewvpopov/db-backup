@@ -1,0 +1,333 @@
+import { createRequire } from 'module';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import zlib from 'zlib';
+import { afterEach, describe, expect, it } from 'vitest';
+
+const require = createRequire(import.meta.url);
+const {
+  DEFAULT_RETENTION_POLICY,
+  listBackupsWithPlan,
+  planRetention,
+  restoreBackup,
+  runBackupJob,
+} = require('../index.js') as typeof import('../index');
+
+const fixedNow = new Date('2026-07-05T15:00:00.000Z');
+const tempDirs: string[] = [];
+
+function makeTempDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-manager-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function makeRuntime(overrides: Partial<{
+  commandExists: (command: string) => boolean;
+  execFileSync: (command: string, args: string[], options?: unknown) => void;
+  sleep: (ms: number) => void;
+  now: () => Date;
+  randomId: () => string;
+}> = {}) {
+  return {
+    commandExists: () => false,
+    execFileSync: () => undefined,
+    sleep: () => undefined,
+    now: () => fixedNow,
+    randomId: () => 'fixed-restore-id',
+    ...overrides,
+  };
+}
+
+function backupEntry(fileName: string, ageDays: number) {
+  const createdAt = new Date(fixedNow.getTime() - ageDays * 24 * 60 * 60 * 1000).toISOString();
+
+  return {
+    fileName,
+    fullPath: `/backups/${fileName}`,
+    engine: 'sqlite' as const,
+    compressed: true,
+    createdAt,
+    sizeBytes: 128,
+  };
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe('@bewks/db-backup-manager', () => {
+  it('creates a SQLite backup from a URL-encoded relative file path without external binaries', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'db with spaces.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'sqlite bytes');
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./db%20with%20spaces.db?connection_limit=1',
+      outputDir,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.created).toMatchObject({
+      fileName: 'sqlite-backup-20260705-150000Z.db',
+      engine: 'sqlite',
+      compressed: false,
+      createdAt: fixedNow.toISOString(),
+    });
+    expect(fs.readFileSync(result.created.fullPath, 'utf8')).toBe('sqlite bytes');
+    expect(result.kept.map((entry) => entry.fileName)).toContain(result.created.fileName);
+  });
+
+  it('does not overwrite a same-second SQLite backup', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'sqlite bytes');
+
+    const first = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      runtime: makeRuntime(),
+    });
+    fs.writeFileSync(sourcePath, 'new sqlite bytes');
+    const second = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      runtime: makeRuntime(),
+    });
+
+    expect(first.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
+    expect(second.created.fileName).toBe('sqlite-backup-20260705-150000Z-2.db');
+    expect(fs.readFileSync(first.created.fullPath, 'utf8')).toBe('sqlite bytes');
+    expect(fs.readFileSync(second.created.fullPath, 'utf8')).toBe('new sqlite bytes');
+  });
+
+  it('uses sqlite3 .backup and gzip when those commands are available', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'dev.db');
+    const outputDir = path.join(cwd, 'backups');
+    const calls: Array<{ command: string; args: string[] }> = [];
+    fs.writeFileSync(sourcePath, 'source should not be copied directly');
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'sqlite3' || command === 'gzip',
+      execFileSync: (command, args) => {
+        calls.push({ command, args });
+        if (command === 'sqlite3') {
+          const backupCommand = args[3];
+          const match = backupCommand.match(/^\.backup '(.+)'$/);
+          if (!match) throw new Error(`Unexpected sqlite backup command: ${backupCommand}`);
+          fs.writeFileSync(match[1].replace(/''/g, "'"), 'sqlite backup from command');
+        }
+        if (command === 'gzip') {
+          fs.renameSync(args[1], `${args[1]}.gz`);
+        }
+      },
+    });
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./dev.db',
+      outputDir,
+      runtime: runtime,
+    });
+
+    expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db.gz');
+    expect(result.created.compressed).toBe(true);
+    expect(calls).toEqual([
+      {
+        command: 'sqlite3',
+        args: ['-cmd', '.timeout 5000', sourcePath, `.backup '${path.join(outputDir, 'sqlite-backup-20260705-150000Z.db')}'`],
+      },
+      {
+        command: 'gzip',
+        args: ['-f', path.join(outputDir, 'sqlite-backup-20260705-150000Z.db')],
+      },
+    ]);
+  });
+
+  it('uses pg_dump custom format for PostgreSQL backups', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'pg_dump',
+      execFileSync: (command, args) => {
+        calls.push({ command, args });
+        const outputArg = args.find((arg) => arg.startsWith('--file='));
+        if (!outputArg) throw new Error('pg_dump call missing --file argument');
+        fs.writeFileSync(outputArg.slice('--file='.length), 'postgres dump');
+      },
+    });
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl,
+      outputDir,
+      runtime: runtime,
+    });
+
+    const expectedPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump');
+    expect(result.created).toMatchObject({
+      fileName: 'postgres-backup-20260705-150000Z.dump',
+      fullPath: expectedPath,
+      engine: 'postgres',
+      compressed: false,
+    });
+    expect(calls).toEqual([
+      {
+        command: 'pg_dump',
+        args: ['--format=custom', `--file=${expectedPath}`, databaseUrl],
+      },
+    ]);
+  });
+
+  it('does not overwrite a same-second PostgreSQL backup', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'pg_dump',
+      execFileSync: (command, args) => {
+        calls.push({ command, args });
+        const outputArg = args.find((arg) => arg.startsWith('--file='));
+        if (!outputArg) throw new Error('pg_dump call missing --file argument');
+        fs.writeFileSync(outputArg.slice('--file='.length), `postgres dump ${calls.length}`);
+      },
+    });
+
+    const first = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
+    const second = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
+
+    expect(first.created.fileName).toBe('postgres-backup-20260705-150000Z.dump');
+    expect(second.created.fileName).toBe('postgres-backup-20260705-150000Z-2.dump');
+    expect(fs.readFileSync(first.created.fullPath, 'utf8')).toBe('postgres dump 1');
+    expect(fs.readFileSync(second.created.fullPath, 'utf8')).toBe('postgres dump 2');
+  });
+
+  it('restores PostgreSQL dumps with clean transactional pg_restore and redacts the target URL', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump');
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(backupPath, 'postgres dump');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl,
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'pg_restore',
+        execFileSync: (command, args) => calls.push({ command, args }),
+      }),
+    });
+
+    expect(calls).toEqual([
+      {
+        command: 'pg_restore',
+        args: [
+          '--clean',
+          '--if-exists',
+          '--no-owner',
+          '--no-privileges',
+          '--single-transaction',
+          '--dbname',
+          databaseUrl,
+          backupPath,
+        ],
+      },
+    ]);
+    expect(result.target).toBe('postgresql://user:***@db.example/app');
+  });
+
+  it('restores compressed SQLite backups atomically through a temp file', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old database');
+    fs.writeFileSync(backupPath, zlib.gzipSync(Buffer.from('restored database')));
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+    expect(fs.existsSync(path.join(path.dirname(dbPath), '.restore-fixed-restore-id.db'))).toBe(false);
+  });
+
+  it('plans retention with recent daily slots plus anchor backups', () => {
+    const backups = [
+      backupEntry('day-0.db.gz', 0),
+      backupEntry('day-1.db.gz', 1),
+      backupEntry('day-2.db.gz', 2),
+      backupEntry('day-8.db.gz', 8),
+      backupEntry('day-31.db.gz', 31),
+      backupEntry('day-61.db.gz', 61),
+      backupEntry('day-90.db.gz', 90),
+    ];
+
+    const plan = planRetention(backups, DEFAULT_RETENTION_POLICY, fixedNow);
+
+    expect(plan.keep.map((entry) => [entry.fileName, entry.retentionReason])).toEqual([
+      ['day-0.db.gz', 'daily'],
+      ['day-1.db.gz', 'daily'],
+      ['day-2.db.gz', 'daily'],
+      ['day-8.db.gz', 'last_week'],
+      ['day-31.db.gz', 'last_month'],
+      ['day-61.db.gz', 'two_months_ago'],
+    ]);
+    expect(plan.remove.map((entry) => entry.fileName)).toEqual(['day-90.db.gz']);
+  });
+
+  it('lists only supported backup filenames and annotates retention decisions', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'sqlite');
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z-2.db'), 'sqlite again');
+    fs.writeFileSync(path.join(outputDir, 'notes.txt'), 'ignore me');
+
+    const result = listBackupsWithPlan({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.backups).toHaveLength(2);
+    expect(result.backups[0]).toMatchObject({
+      fileName: 'sqlite-backup-20260705-150000Z-2.db',
+      keep: true,
+      retentionReason: 'daily',
+    });
+    expect(result.backups[1]).toMatchObject({
+      fileName: 'sqlite-backup-20260705-150000Z.db',
+      keep: true,
+      retentionReason: 'daily',
+    });
+  });
+});

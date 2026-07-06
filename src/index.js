@@ -1,0 +1,983 @@
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const zlib = require('zlib');
+const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const DEFAULT_RETENTION_POLICY = {
+  maxBackups: 6,
+  dailySlots: 3,
+  anchors: [
+    {
+      key: 'last_week',
+      label: 'Last week',
+      minAgeDays: 7,
+      maxAgeDays: 20,
+      targetAgeDays: 7,
+    },
+    {
+      key: 'last_month',
+      label: 'Last month',
+      minAgeDays: 28,
+      maxAgeDays: 59,
+      targetAgeDays: 30,
+    },
+    {
+      key: 'two_months_ago',
+      label: '2 months ago',
+      minAgeDays: 56,
+      maxAgeDays: 89,
+      targetAgeDays: 60,
+    },
+  ],
+};
+
+const DEFAULT_ENV_FILES = {
+  base: '.env',
+  dev: '.env.local',
+  prod: '.env.production',
+};
+
+const DEFAULT_OUTPUT_DIR = path.resolve(process.cwd(), 'backups', 'database');
+
+function parseArgs(argv) {
+  const options = {
+    command: 'backup',
+    mode: process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
+    outputDir: DEFAULT_OUTPUT_DIR,
+    compressSqlite: true,
+    json: false,
+    hour: 3,
+    minute: 0,
+    backupFile: null,
+    useLatest: false,
+    createPreRestoreBackup: true,
+  };
+
+  const commandArg = argv[0];
+  if (commandArg === 'backup' || commandArg === 'list' || commandArg === 'cron' || commandArg === 'restore') {
+    options.command = commandArg;
+    argv = argv.slice(1);
+  }
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === '--prod') {
+      options.mode = 'prod';
+      continue;
+    }
+
+    if (arg === '--dev') {
+      options.mode = 'dev';
+      continue;
+    }
+
+    if (arg === '--output-dir') {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error('Missing value for --output-dir');
+      }
+      options.outputDir = path.resolve(process.cwd(), value);
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--no-compress') {
+      options.compressSqlite = false;
+      continue;
+    }
+
+    if (arg === '--json') {
+      options.json = true;
+      continue;
+    }
+
+    if (arg === '--hour') {
+      const value = Number.parseInt(argv[index + 1], 10);
+      if (!Number.isInteger(value) || value < 0 || value > 23) {
+        throw new Error('--hour must be an integer from 0 to 23');
+      }
+      options.hour = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--minute') {
+      const value = Number.parseInt(argv[index + 1], 10);
+      if (!Number.isInteger(value) || value < 0 || value > 59) {
+        throw new Error('--minute must be an integer from 0 to 59');
+      }
+      options.minute = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--file' || arg === '--backup') {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+      options.backupFile = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--latest') {
+      options.useLatest = true;
+      continue;
+    }
+
+    if (arg === '--no-pre-backup') {
+      options.createPreRestoreBackup = false;
+      continue;
+    }
+
+    if (arg === '--help' || arg === '-h') {
+      options.command = 'help';
+      continue;
+    }
+
+    throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  return options;
+}
+
+function formatTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
+}
+
+function parseTimestampKey(timestampKey) {
+  const match = timestampKey.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})Z$/);
+  if (!match) {
+    return null;
+  }
+
+  const [, year, month, day, hour, minute, second] = match;
+  return new Date(Date.UTC(
+    Number.parseInt(year, 10),
+    Number.parseInt(month, 10) - 1,
+    Number.parseInt(day, 10),
+    Number.parseInt(hour, 10),
+    Number.parseInt(minute, 10),
+    Number.parseInt(second, 10)
+  ));
+}
+
+function commandExists(command, runner = execFileSync) {
+  try {
+    runner('sh', ['-lc', `command -v ${command}`], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function normalizeRuntime(runtime = {}) {
+  const runCommand = runtime.execFileSync || execFileSync;
+
+  return {
+    execFileSync: runCommand,
+    commandExists: runtime.commandExists || ((command) => commandExists(command, runCommand)),
+    sleep: runtime.sleep || sleep,
+    now: runtime.now || (() => new Date()),
+    randomId: runtime.randomId || (() => `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+  };
+}
+
+function parseSqlitePath(databaseUrl, cwd = process.cwd()) {
+  const [withoutParams] = databaseUrl.split('?');
+  let filePath = decodeURIComponent(withoutParams.slice('file:'.length));
+
+  if (!filePath) {
+    throw new Error('DATABASE_URL points to an empty SQLite file path.');
+  }
+
+  if (filePath.startsWith('///')) {
+    filePath = filePath.slice(2);
+  } else if (filePath.startsWith('//')) {
+    filePath = filePath.slice(1);
+  }
+
+  return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+}
+
+function detectDatabaseEngine(databaseUrl) {
+  if (databaseUrl.startsWith('file:')) {
+    return 'sqlite';
+  }
+  if (databaseUrl.startsWith('postgres://') || databaseUrl.startsWith('postgresql://')) {
+    return 'postgres';
+  }
+  return 'unknown';
+}
+
+function buildBackupFilename(engine, timestamp, compressSqlite, sequence = 1) {
+  const suffix = sequence > 1 ? `-${sequence}` : '';
+  if (engine === 'sqlite') {
+    return `sqlite-backup-${timestamp}${suffix}.db${compressSqlite ? '.gz' : ''}`;
+  }
+  if (engine === 'postgres') {
+    return `postgres-backup-${timestamp}${suffix}.dump`;
+  }
+  return `db-backup-${engine}-${timestamp}${suffix}.bak`;
+}
+
+function buildUniqueBackupPath({ engine, timestamp, outputDir, compressSqlite = false }) {
+  for (let sequence = 1; sequence < 1000; sequence += 1) {
+    const fileName = buildBackupFilename(engine, timestamp, compressSqlite, sequence);
+    const fullPath = path.join(outputDir, fileName);
+
+    if (!fs.existsSync(fullPath)) {
+      return { fileName, fullPath };
+    }
+  }
+
+  throw new Error(`Unable to allocate a unique backup filename for ${engine} at ${timestamp}`);
+}
+
+function buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite }) {
+  for (let sequence = 1; sequence < 1000; sequence += 1) {
+    const rawFileName = buildBackupFilename('sqlite', timestamp, false, sequence);
+    const rawFilePath = path.join(outputDir, rawFileName);
+    const compressedFilePath = `${rawFilePath}.gz`;
+
+    if (!fs.existsSync(rawFilePath) && (!compressSqlite || !fs.existsSync(compressedFilePath))) {
+      return { rawFileName, rawFilePath };
+    }
+  }
+
+  throw new Error(`Unable to allocate a unique SQLite backup filename for ${timestamp}`);
+}
+
+function parseBackupFileName(fileName) {
+  const sqliteMatch = fileName.match(/^sqlite-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.db(\.gz)?$/);
+  if (sqliteMatch) {
+    return {
+      engine: 'sqlite',
+      timestampKey: sqliteMatch[1],
+      sequence: sqliteMatch[2] ? Number.parseInt(sqliteMatch[2], 10) : 1,
+      compressed: Boolean(sqliteMatch[3]),
+    };
+  }
+
+  const postgresMatch = fileName.match(/^postgres-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.dump$/);
+  if (postgresMatch) {
+    return {
+      engine: 'postgres',
+      timestampKey: postgresMatch[1],
+      sequence: postgresMatch[2] ? Number.parseInt(postgresMatch[2], 10) : 1,
+      compressed: false,
+    };
+  }
+
+  return null;
+}
+
+function loadEnvironment({
+  mode = process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
+  cwd = process.cwd(),
+  envFiles = DEFAULT_ENV_FILES,
+  strictProductionEnv = true,
+} = {}) {
+  const initialDatabaseUrl = process.env.DATABASE_URL;
+  const basePath = path.resolve(cwd, envFiles.base || DEFAULT_ENV_FILES.base);
+  const modePath = path.resolve(cwd, mode === 'prod' ? (envFiles.prod || DEFAULT_ENV_FILES.prod) : (envFiles.dev || DEFAULT_ENV_FILES.dev));
+
+  if (fs.existsSync(basePath)) {
+    loadDotenv({ path: basePath });
+  }
+
+  if (fs.existsSync(modePath)) {
+    loadDotenv({ path: modePath, override: true });
+  }
+
+  if (mode === 'prod' && strictProductionEnv && !initialDatabaseUrl) {
+    const modeHasDatabaseUrl = fs.existsSync(modePath)
+      ? Boolean(parseDotenv(fs.readFileSync(modePath, 'utf8')).DATABASE_URL)
+      : false;
+
+    if (!modeHasDatabaseUrl) {
+      throw new Error('For production backups, set DATABASE_URL in .env.production (or export it in shell).');
+    }
+  }
+
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error(`DATABASE_URL is missing for mode "${mode}".`);
+  }
+
+  return {
+    databaseUrl,
+    mode,
+    envPaths: {
+      base: basePath,
+      mode: modePath,
+    },
+  };
+}
+
+function resolveBackupOptions(options = {}) {
+  const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
+  const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
+  const outputDir = path.resolve(cwd, options.outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
+  const compressSqlite = options.compressSqlite !== false;
+  const policy = options.policy || DEFAULT_RETENTION_POLICY;
+  const runtime = normalizeRuntime(options.runtime || options._runtime);
+
+  const databaseUrl = options.databaseUrl || loadEnvironment({
+    mode,
+    cwd,
+    envFiles: options.envFiles || DEFAULT_ENV_FILES,
+    strictProductionEnv: options.strictProductionEnv !== false,
+  }).databaseUrl;
+
+  return {
+    cwd,
+    mode,
+    outputDir,
+    compressSqlite,
+    policy,
+    databaseUrl,
+    runtime,
+  };
+}
+
+function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime() }) {
+  now = now || runtime.now();
+  const sourcePath = parseSqlitePath(databaseUrl, cwd);
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`SQLite database file not found: ${sourcePath}`);
+  }
+
+  const timestamp = formatTimestamp(now);
+  const { rawFilePath } = buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite });
+
+  if (runtime.commandExists('sqlite3')) {
+    const escapedBackupPath = rawFilePath.replace(/'/g, "''");
+    const sqliteArgs = ['-cmd', '.timeout 5000', sourcePath, `.backup '${escapedBackupPath}'`];
+    const maxAttempts = 5;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        runtime.execFileSync('sqlite3', sqliteArgs, { stdio: 'pipe' });
+        break;
+      } catch (error) {
+        const stdOut = error.stdout ? error.stdout.toString() : '';
+        const stdErr = error.stderr ? error.stderr.toString() : '';
+        const combined = `${stdOut}\n${stdErr}\n${error.message}`;
+        const isLockError = /database is locked/i.test(combined);
+
+        if (!isLockError || attempt === maxAttempts) {
+          throw error;
+        }
+
+        runtime.sleep(attempt * 1000);
+      }
+    }
+  } else {
+    fs.copyFileSync(sourcePath, rawFilePath);
+  }
+
+  let finalPath = rawFilePath;
+  let compressed = false;
+  if (compressSqlite && runtime.commandExists('gzip')) {
+    runtime.execFileSync('gzip', ['-f', rawFilePath], { stdio: 'inherit' });
+    finalPath = `${rawFilePath}.gz`;
+    compressed = true;
+  }
+
+  const stats = fs.statSync(finalPath);
+  return {
+    fileName: path.basename(finalPath),
+    fullPath: finalPath,
+    engine: 'sqlite',
+    compressed,
+    createdAt: now.toISOString(),
+    sizeBytes: stats.size,
+  };
+}
+
+function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalizeRuntime() }) {
+  now = now || runtime.now();
+  if (!runtime.commandExists('pg_dump')) {
+    throw new Error('pg_dump is required for PostgreSQL backups but is not installed.');
+  }
+
+  const timestamp = formatTimestamp(now);
+  const { fileName, fullPath } = buildUniqueBackupPath({
+    engine: 'postgres',
+    timestamp,
+    outputDir,
+  });
+  runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, databaseUrl], { stdio: 'inherit' });
+  const stats = fs.statSync(fullPath);
+
+  return {
+    fileName,
+    fullPath,
+    engine: 'postgres',
+    compressed: false,
+    createdAt: now.toISOString(),
+    sizeBytes: stats.size,
+  };
+}
+
+function createBackup(options = {}) {
+  const resolved = resolveBackupOptions(options);
+  const now = resolved.runtime.now();
+  fs.mkdirSync(resolved.outputDir, { recursive: true });
+
+  const engine = detectDatabaseEngine(resolved.databaseUrl);
+  if (engine === 'sqlite') {
+    return createSqliteBackup({
+      databaseUrl: resolved.databaseUrl,
+      outputDir: resolved.outputDir,
+      compressSqlite: resolved.compressSqlite,
+      cwd: resolved.cwd,
+      now,
+      runtime: resolved.runtime,
+    });
+  }
+
+  if (engine === 'postgres') {
+    return createPostgresBackup({
+      databaseUrl: resolved.databaseUrl,
+      outputDir: resolved.outputDir,
+      now,
+      runtime: resolved.runtime,
+    });
+  }
+
+  throw new Error('Unsupported DATABASE_URL scheme. Expected file:, postgres://, or postgresql://');
+}
+
+function getBackupEntryFromPath(backupPath, now = new Date()) {
+  if (!fs.existsSync(backupPath)) {
+    throw new Error(`Backup file not found: ${backupPath}`);
+  }
+
+  const fileName = path.basename(backupPath);
+  const parsed = parseBackupFileName(fileName);
+  if (!parsed) {
+    throw new Error(`Unsupported backup filename format: ${fileName}`);
+  }
+
+  const stats = fs.statSync(backupPath);
+  const timestampDate = parseTimestampKey(parsed.timestampKey);
+  const createdAt = timestampDate || stats.mtime;
+  const ageDays = (now.getTime() - createdAt.getTime()) / DAY_MS;
+
+  return {
+    fileName,
+    fullPath: backupPath,
+    engine: parsed.engine,
+    compressed: parsed.compressed,
+    createdAt: createdAt.toISOString(),
+    sizeBytes: stats.size,
+    ageDays,
+  };
+}
+
+function resolveRestoreBackup({
+  backupFile,
+  useLatest = false,
+  outputDir = DEFAULT_OUTPUT_DIR,
+  now = new Date(),
+} = {}) {
+  const absoluteOutputDir = path.resolve(outputDir);
+
+  if (backupFile) {
+    const candidatePath = path.isAbsolute(backupFile)
+      ? backupFile
+      : path.resolve(absoluteOutputDir, backupFile);
+    return getBackupEntryFromPath(candidatePath, now);
+  }
+
+  if (useLatest) {
+    const backups = listBackups({ outputDir: absoluteOutputDir, now });
+    if (backups.length === 0) {
+      throw new Error(`No backups found in: ${absoluteOutputDir}`);
+    }
+    return backups[0];
+  }
+
+  throw new Error('Restore requires --file <backup-file> or --latest.');
+}
+
+function redactDatabaseUrl(databaseUrl) {
+  try {
+    const parsed = new URL(databaseUrl);
+    if (parsed.password) {
+      parsed.password = '***';
+    }
+    return parsed.toString();
+  } catch {
+    return 'postgres://<redacted>';
+  }
+}
+
+function restoreSqliteBackup({
+  databaseUrl,
+  backupEntry,
+  cwd = process.cwd(),
+  runtime = normalizeRuntime(),
+} = {}) {
+  const destinationPath = parseSqlitePath(databaseUrl, cwd);
+  fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+
+  const tempPath = path.join(
+    path.dirname(destinationPath),
+    `.restore-${runtime.randomId()}.db`
+  );
+
+  try {
+    if (backupEntry.compressed) {
+      const compressed = fs.readFileSync(backupEntry.fullPath);
+      const decompressed = zlib.gunzipSync(compressed);
+      fs.writeFileSync(tempPath, decompressed);
+    } else {
+      fs.copyFileSync(backupEntry.fullPath, tempPath);
+    }
+
+    if (fs.existsSync(destinationPath)) {
+      fs.unlinkSync(destinationPath);
+    }
+
+    fs.renameSync(tempPath, destinationPath);
+  } catch (error) {
+    if (fs.existsSync(tempPath)) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+    throw error;
+  }
+
+  return {
+    target: destinationPath,
+  };
+}
+
+function restorePostgresBackup({
+  databaseUrl,
+  backupEntry,
+  runtime = normalizeRuntime(),
+} = {}) {
+  if (!runtime.commandExists('pg_restore')) {
+    throw new Error('pg_restore is required for PostgreSQL restores but is not installed.');
+  }
+
+  runtime.execFileSync(
+    'pg_restore',
+    [
+      '--clean',
+      '--if-exists',
+      '--no-owner',
+      '--no-privileges',
+      '--single-transaction',
+      '--dbname',
+      databaseUrl,
+      backupEntry.fullPath,
+    ],
+    { stdio: 'inherit' }
+  );
+
+  return {
+    target: redactDatabaseUrl(databaseUrl),
+  };
+}
+
+function restoreBackup(options = {}) {
+  const resolved = resolveBackupOptions(options);
+  const now = resolved.runtime.now();
+  const backupEntry = resolveRestoreBackup({
+    backupFile: options.backupFile,
+    useLatest: options.useLatest,
+    outputDir: resolved.outputDir,
+    now,
+  });
+  const databaseEngine = detectDatabaseEngine(resolved.databaseUrl);
+
+  if (databaseEngine === 'unknown') {
+    throw new Error('Unsupported DATABASE_URL for restore. Expected file:, postgres://, or postgresql://');
+  }
+
+  if (backupEntry.engine !== databaseEngine) {
+    throw new Error(
+      `Backup engine mismatch. Selected backup is "${backupEntry.engine}" but DATABASE_URL uses "${databaseEngine}".`
+    );
+  }
+
+  let preRestoreBackup = null;
+  if (options.createPreRestoreBackup !== false) {
+    preRestoreBackup = createBackup({
+      ...resolved,
+      databaseUrl: resolved.databaseUrl,
+      mode: resolved.mode,
+      outputDir: resolved.outputDir,
+      compressSqlite: resolved.compressSqlite,
+      cwd: resolved.cwd,
+      runtime: resolved.runtime,
+    });
+  }
+
+  let restoreResult;
+  if (databaseEngine === 'sqlite') {
+    restoreResult = restoreSqliteBackup({
+      databaseUrl: resolved.databaseUrl,
+      backupEntry,
+      cwd: resolved.cwd,
+      runtime: resolved.runtime,
+    });
+  } else {
+    restoreResult = restorePostgresBackup({
+      databaseUrl: resolved.databaseUrl,
+      backupEntry,
+      runtime: resolved.runtime,
+    });
+  }
+
+  return {
+    restored: backupEntry,
+    preRestoreBackup,
+    mode: resolved.mode,
+    outputDir: resolved.outputDir,
+    engine: databaseEngine,
+    restoredAt: now.toISOString(),
+    target: restoreResult.target,
+  };
+}
+
+function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date() } = {}) {
+  const absoluteOutputDir = path.resolve(outputDir);
+  if (!fs.existsSync(absoluteOutputDir)) {
+    return [];
+  }
+
+  const files = fs.readdirSync(absoluteOutputDir)
+    .map((fileName) => {
+      const parsed = parseBackupFileName(fileName);
+      if (!parsed) {
+        return null;
+      }
+
+      const timestampDate = parseTimestampKey(parsed.timestampKey);
+      const fullPath = path.join(absoluteOutputDir, fileName);
+      const fileStats = fs.statSync(fullPath);
+      const createdAt = timestampDate || fileStats.mtime;
+      const ageDays = (now.getTime() - createdAt.getTime()) / DAY_MS;
+
+      return {
+        fileName,
+        fullPath,
+        engine: parsed.engine,
+        compressed: parsed.compressed,
+        createdAt: createdAt.toISOString(),
+        sizeBytes: fileStats.size,
+        ageDays,
+        _sortSequence: parsed.sequence,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => {
+      const createdAtDiff = new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+      return createdAtDiff || right._sortSequence - left._sortSequence || right.fileName.localeCompare(left.fileName);
+    })
+    .map(({ _sortSequence, ...entry }) => entry);
+
+  return files;
+}
+
+function chooseAnchorCandidate(backups, anchor, now, excludedNames) {
+  const candidates = backups
+    .filter((backup) => !excludedNames.has(backup.fileName))
+    .map((backup) => ({
+      ...backup,
+      ageDays: (now.getTime() - new Date(backup.createdAt).getTime()) / DAY_MS,
+    }))
+    .filter((backup) => backup.ageDays >= anchor.minAgeDays && backup.ageDays <= anchor.maxAgeDays);
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    const leftDistance = Math.abs(left.ageDays - anchor.targetAgeDays);
+    const rightDistance = Math.abs(right.ageDays - anchor.targetAgeDays);
+    if (leftDistance !== rightDistance) {
+      return leftDistance - rightDistance;
+    }
+
+    return new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime();
+  });
+
+  return candidates[0];
+}
+
+function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Date()) {
+  const selected = [];
+  const selectedNames = new Set();
+
+  const sorted = [...backups].sort(
+    (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
+  );
+
+  const dailyCount = Math.min(policy.dailySlots, policy.maxBackups);
+  sorted.slice(0, dailyCount).forEach((backup, index) => {
+    selected.push({
+      ...backup,
+      retentionReason: 'daily',
+      retentionLabel: `Daily slot ${index + 1}`,
+    });
+    selectedNames.add(backup.fileName);
+  });
+
+  for (const anchor of policy.anchors) {
+    if (selected.length >= policy.maxBackups) {
+      break;
+    }
+
+    const match = chooseAnchorCandidate(sorted, anchor, now, selectedNames);
+    if (!match) {
+      continue;
+    }
+
+    selected.push({
+      ...match,
+      retentionReason: anchor.key,
+      retentionLabel: anchor.label,
+    });
+    selectedNames.add(match.fileName);
+  }
+
+  const keepMap = new Map(selected.map((item) => [item.fileName, item]));
+  const keep = sorted.filter((backup) => keepMap.has(backup.fileName)).map((backup) => keepMap.get(backup.fileName));
+  const remove = sorted
+    .filter((backup) => !keepMap.has(backup.fileName))
+    .map((backup) => ({
+      ...backup,
+      retentionReason: 'rotate_out',
+      retentionLabel: 'Rotate out',
+    }));
+
+  return {
+    keep,
+    remove,
+    policy,
+  };
+}
+
+function pruneBackups(backupsToRemove = []) {
+  const deleted = [];
+
+  backupsToRemove.forEach((backup) => {
+    if (fs.existsSync(backup.fullPath)) {
+      fs.unlinkSync(backup.fullPath);
+      deleted.push(backup);
+    }
+  });
+
+  return deleted;
+}
+
+function listBackupsWithPlan(options = {}) {
+  const resolved = resolveBackupOptions(options);
+  const now = resolved.runtime.now();
+  const backups = listBackups({ outputDir: resolved.outputDir, now });
+  const plan = planRetention(backups, resolved.policy, now);
+
+  const keepNames = new Set(plan.keep.map((entry) => entry.fileName));
+  const backupRows = backups.map((backup) => {
+    const keepEntry = plan.keep.find((entry) => entry.fileName === backup.fileName);
+
+    return {
+      ...backup,
+      keep: keepNames.has(backup.fileName),
+      retentionReason: keepEntry ? keepEntry.retentionReason : 'rotate_out',
+      retentionLabel: keepEntry ? keepEntry.retentionLabel : 'Rotate out',
+    };
+  });
+
+  return {
+    backups: backupRows,
+    plan,
+    mode: resolved.mode,
+    outputDir: resolved.outputDir,
+    policy: resolved.policy,
+  };
+}
+
+function runBackupJob(options = {}) {
+  const resolved = resolveBackupOptions(options);
+  const created = createBackup(resolved);
+  const now = resolved.runtime.now();
+  const backups = listBackups({ outputDir: resolved.outputDir, now });
+  const plan = planRetention(backups, resolved.policy, now);
+  const removed = pruneBackups(plan.remove);
+
+  return {
+    created,
+    removed,
+    kept: plan.keep,
+    mode: resolved.mode,
+    outputDir: resolved.outputDir,
+    policy: resolved.policy,
+  };
+}
+
+function buildDailyCronEntry({
+  hour = 3,
+  minute = 0,
+  command = "cd /path/to/app && npm run db:backup:prod",
+  logPath = "/var/log/db-backup.log",
+} = {}) {
+  return `${minute} ${hour} * * * /usr/bin/env bash -lc '${command} >> "${logPath}" 2>&1'`;
+}
+
+function formatBytes(sizeBytes) {
+  if (sizeBytes < 1024) {
+    return `${sizeBytes} B`;
+  }
+
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = sizeBytes / 1024;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${value.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function showHelp() {
+  console.log(`
+Usage:
+  db-backup-manager [backup|list|cron|restore] [options]
+
+Commands:
+  backup                  Create a backup and apply retention policy (default)
+  list                    List backups with keep/rotate decisions
+  cron                    Print a daily cron entry
+  restore                 Restore database from backup file
+
+Options:
+  --prod                  Use production env files (.env + .env.production)
+  --dev                   Use development env files (.env + .env.local)
+  --output-dir <path>     Backup directory (default: backups/database)
+  --no-compress           Disable gzip for SQLite backups
+  --json                  Print JSON output
+  --hour <0-23>           Hour for cron output (command: cron)
+  --minute <0-59>         Minute for cron output (command: cron)
+  --file <name|path>      Backup file to restore (command: restore)
+  --latest                Restore latest backup in output-dir (command: restore)
+  --no-pre-backup         Skip safety backup before restore (command: restore)
+  --help                  Show help
+`);
+}
+
+function runCli(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv);
+
+  if (options.command === 'help') {
+    showHelp();
+    return;
+  }
+
+  if (options.command === 'cron') {
+    const cronLine = buildDailyCronEntry({
+      hour: options.hour,
+      minute: options.minute,
+      command: `cd "${process.cwd()}" && npm run db:backup -- --prod`,
+      logPath: path.resolve(process.cwd(), 'backups', 'database', 'backup.log'),
+    });
+    console.log(cronLine);
+    return;
+  }
+
+  const baseOptions = {
+    mode: options.mode,
+    outputDir: options.outputDir,
+    compressSqlite: options.compressSqlite,
+  };
+
+  if (options.command === 'list') {
+    const result = listBackupsWithPlan(baseOptions);
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    console.log(`[db-backup] Mode: ${result.mode}`);
+    console.log(`[db-backup] Output directory: ${result.outputDir}`);
+    console.log(`[db-backup] Total backups: ${result.backups.length}`);
+
+    result.backups.forEach((backup) => {
+      const marker = backup.keep ? 'KEEP' : 'DROP';
+      console.log(`  ${marker} | ${backup.fileName} | ${backup.retentionLabel} | ${formatBytes(backup.sizeBytes)}`);
+    });
+    return;
+  }
+
+  if (options.command === 'restore') {
+    const restoreResult = restoreBackup({
+      ...baseOptions,
+      backupFile: options.backupFile,
+      useLatest: options.useLatest,
+      createPreRestoreBackup: options.createPreRestoreBackup,
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify(restoreResult, null, 2));
+      return;
+    }
+
+    console.log(`[db-backup] Mode: ${restoreResult.mode}`);
+    console.log(`[db-backup] Output directory: ${restoreResult.outputDir}`);
+    console.log(`[db-backup] Restored backup: ${restoreResult.restored.fileName}`);
+    if (restoreResult.preRestoreBackup) {
+      console.log(`[db-backup] Safety backup created: ${restoreResult.preRestoreBackup.fileName}`);
+    }
+    console.log(`[db-backup] Restore target: ${restoreResult.target}`);
+    console.log('[db-backup] Restore completed. Restart your application before serving traffic.');
+    return;
+  }
+
+  const result = runBackupJob(baseOptions);
+
+  if (options.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(`[db-backup] Mode: ${result.mode}`);
+  console.log(`[db-backup] Output directory: ${result.outputDir}`);
+  console.log(`[db-backup] Backup created: ${result.created.fileName}`);
+  console.log(`[db-backup] Keeping ${result.kept.length} backup(s), removed ${result.removed.length} backup(s).`);
+
+  if (result.removed.length > 0) {
+    console.log(`[db-backup] Removed: ${result.removed.map((entry) => entry.fileName).join(', ')}`);
+  }
+}
+
+module.exports = {
+  DEFAULT_RETENTION_POLICY,
+  buildDailyCronEntry,
+  listBackupsWithPlan,
+  planRetention,
+  restoreBackup,
+  runBackupJob,
+  runCli,
+};
