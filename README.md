@@ -1,4 +1,4 @@
-# @andrewvpopov/db-backup
+# @andrewpopov/db-backup
 
 ## Document Status
 - Status: Active package reference
@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewvpopov/db-backup#v0.5.0
+npm install github:andrewpopov/db-backup#v0.5.0
 ```
 
 Reusable database backup utilities with an age-tiered retention strategy
@@ -125,7 +125,7 @@ const {
   listBackupsWithPlan,
   restoreBackup,
   DEFAULT_RETENTION_POLICY,
-} = require('@andrewvpopov/db-backup');
+} = require('@andrewpopov/db-backup');
 
 const result = runBackupJob({
   mode: 'prod',

@@ -1,5 +1,5 @@
 {
-  "name": "@andrewvpopov/db-backup",
+  "name": "@andrewpopov/db-backup",
   "version": "0.5.0",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "main": "src/index.js",

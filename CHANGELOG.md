@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
+All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
 ## 0.5.0
@@ -13,8 +13,8 @@ behavior and defaults are unchanged.
 - **Fix**: README title, Usage/recipes/cron examples, the programmatic
   `require(...)` snippet, and the CLI's own `--help` usage line all still said
   `@bewks/db-backup-manager` / `db-backup-manager`. Replaced everywhere with
-  `@andrewvpopov/db-backup` / `db-backup`. Added an `## Install` section
-  (`npm install github:andrewvpopov/db-backup#v0.5.0`).
+  `@andrewpopov/db-backup` / `db-backup`. Added an `## Install` section
+  (`npm install github:andrewpopov/db-backup#v0.5.0`).
 - **Fix — clock-skew retention safety**: a future-dated backup filename (clock
   skew) could sort as "newest" and starve a real daily slot. `listBackups` /
   `getBackupEntryFromPath` now clamp the derived `ageDays` to a minimum of 0
@@ -61,6 +61,9 @@ behavior and defaults are unchanged.
   exceeding maxBackups, an empty backup list, the future-dated starvation
   case), the sqlite3 locked-database retry path, and `loadEnvironment`'s
   prod-mode env-file precedence and strict-production-env guard.
+## 0.4.1
+
+- Renamed package scope `@andrewvpopov/*` -> `@andrewpopov/*` after consolidating the GitHub org into the `andrewpopov` user. No runtime or API change; update imports and the `github:` install path to `andrewpopov/db-backup`.
 
 ## 0.4.0
 
@@ -92,7 +95,7 @@ existing `backup`/`restore`/`list` behavior and defaults are unchanged.
 
 - Fix ESM named imports of the storage helpers: export them as shorthand
   identifiers so Node's cjs-module-lexer detects them. `key: storage.fn` was
-  invisible to `import { fn } from "@andrewvpopov/db-backup"` (hit by stoki/sano,
+  invisible to `import { fn } from "@andrewpopov/db-backup"` (hit by stoki/sano,
   which run ESM). No API change.
 - verify-pack now also runs an ESM `import { ... }` smoke to catch this class.
 

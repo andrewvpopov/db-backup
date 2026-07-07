@@ -65,7 +65,7 @@ afterEach(() => {
   }
 });
 
-describe('@andrewvpopov/db-backup', () => {
+describe('@andrewpopov/db-backup', () => {
   it('creates a SQLite backup from a URL-encoded relative file path without external binaries', () => {
     const cwd = makeTempDir();
     const sourcePath = path.join(cwd, 'db with spaces.db');
