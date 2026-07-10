@@ -1911,49 +1911,54 @@ function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } 
   return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
 }
 
-// Newest ModTime under an rclone remote, or null if the remote is empty. Reuses
-// the rclone env + object-path helpers the upload path uses. `rclone lsjson`
-// returns an array of { Path, ModTime, ... }; an unparseable response is a
-// FAILURE (throws), mirroring verifyRemoteObject — "couldn't tell" is never
-// "fresh".
-function remoteNewestModTime(remote, runtime) {
+// Newest backup time under an rclone remote, or null if none. Mirrors
+// pruneRemoteBackups exactly: `rclone lsf --files-only`, keep only files that
+// parse as THIS package's backups (parseBackupFileName — so a stray file, a
+// manifest, or a manually-nested layout can't be mistaken for a backup), and
+// take recency from the filename's embedded timestamp (parseTimestampKey), the
+// same backup identity the rest of the package uses. A failed listing is
+// UNKNOWN — never "fresh" — so it throws (unlike prune, which is best-effort).
+function remoteNewestBackupTime(remote, runtime, namePrefix = null) {
   if (!runtime.commandExists('rclone')) {
     throw new Error('rclone is unavailable — cannot check remote backup freshness');
   }
-  const output = runtime.execFileSync('rclone', ['lsjson', remote.target.replace(/\/+$/, '')], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: rcloneEnv(remote),
-  });
-  let entries;
+  let listing;
   try {
-    entries = JSON.parse((output || '').toString());
-  } catch {
-    throw new Error(`Could not parse rclone lsjson for ${remote.target}; refusing to report freshness`);
-  }
-  if (!Array.isArray(entries)) {
-    throw new Error(`Unexpected rclone lsjson shape for ${remote.target}`);
+    listing = runtime
+      .execFileSync('rclone', ['lsf', remote.target, '--files-only'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: rcloneEnv(remote),
+      })
+      .toString();
+  } catch (err) {
+    throw new Error(
+      `Could not list remote backups at ${remote.target}: ${err && err.message ? err.message : err}`
+    );
   }
   let newest = null;
-  for (const entry of entries) {
-    if (entry && entry.IsDir) continue;
-    const t = entry && entry.ModTime ? new Date(entry.ModTime) : null;
-    if (t && !Number.isNaN(t.getTime()) && (!newest || t.getTime() > newest.getTime())) {
-      newest = t;
+  for (const line of listing.split(/\r?\n/)) {
+    const name = line.trim();
+    if (!name) continue;
+    const parsed = parseBackupFileName(name, namePrefix);
+    if (!parsed) continue;
+    const when = parseTimestampKey(parsed.timestampKey);
+    if (when && (!newest || when.getTime() > newest.getTime())) {
+      newest = when;
     }
   }
   return newest;
 }
 
-// Remote sibling of checkBackupFreshness: the newest object under the rclone
+// Remote sibling of checkBackupFreshness: the newest backup under the rclone
 // remote stands in for the stamp. Returns the SAME { fresh, clockSkew,
 // stampedAt, ageHours, maxAgeHours } shape so the CLI print/exit/notify path is
 // uniform. Lets a host that is NOT the backup host verify the off-site copy —
 // the dead-man's switch the local stamp check can't be (it dies with the host).
-function checkRemoteFreshness({ remote, runtime = normalizeRuntime(), maxAgeHours = 36, now = new Date() } = {}) {
+function checkRemoteFreshness({ remote, runtime = normalizeRuntime(), maxAgeHours = 36, now = new Date(), namePrefix = null } = {}) {
   if (!remote || !remote.target) {
     throw new Error('remote.target is required to check remote backup freshness');
   }
-  const stampedAt = remoteNewestModTime(remote, runtime);
+  const stampedAt = remoteNewestBackupTime(remote, runtime, namePrefix);
   if (!stampedAt) {
     return { fresh: false, clockSkew: false, stampedAt: null, ageHours: null, maxAgeHours };
   }
@@ -2188,6 +2193,7 @@ function runCli(argv = process.argv.slice(2)) {
             },
             runtime: notifyOpts.runtime,
             maxAgeHours: options.maxAgeHours,
+            namePrefix: options.namePrefix,
           })
         : checkBackupFreshness({ stampFile: options.stampFile, maxAgeHours: options.maxAgeHours });
     } catch (err) {

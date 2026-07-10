@@ -340,6 +340,9 @@ export function checkRemoteFreshness(options: {
   maxAgeHours?: number;
   now?: Date;
   runtime?: BackupRuntime;
+  /** Restrict to backups written under this filename prefix (matches the
+   * backup job's `--name-prefix`). Default: the canonical sqlite/postgres names. */
+  namePrefix?: string | null;
 }): BackupFreshness;
 
 /** Best-effort alert delivery for the `freshness` command. NEVER throws and
