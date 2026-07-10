@@ -70,6 +70,8 @@ export interface BackupFreshness {
 
 export interface BackupEntry {
   fileName: string;
+  /** The filename prefix this backup was written under. */
+  prefix?: string;
   fullPath: string;
   engine: 'sqlite' | 'postgres' | 'unknown';
   compressed: boolean;
@@ -110,6 +112,13 @@ export interface BackupOptions {
   remote?: BackupRemote | null;
   /** Local-only run: skip the upload and the remote prune. */
   skipRemote?: boolean;
+  /** Filename prefix. Defaults to `sqlite-backup` / `postgres-backup`. Set this
+   * to adopt an existing backup history written under another name. The engine is
+   * read from the extension (`.db` / `.dump`), not the prefix.
+   *
+   * list/prune/restore are SCOPED to this prefix, so one app's job can never see
+   * or prune another app's backups in a shared directory or remote bucket. */
+  namePrefix?: string | null;
   runtime?: BackupRuntime;
   strictProductionEnv?: boolean;
   /** list/prune set this false: they never open the DB, so DATABASE_URL is not required. */
@@ -251,6 +260,14 @@ export function resolveRetentionPolicy(options?: {
   keepDays?: number | string | null;
   env?: NodeJS.ProcessEnv;
 }): RetentionPolicy;
+/** Parse a backup filename. Without `namePrefix`, only the canonical
+ * `sqlite-backup` / `postgres-backup` prefixes are accepted — the default is
+ * deliberately not widened. Returns null for anything else. */
+export function parseBackupFileName(
+  fileName: string,
+  namePrefix?: string | null,
+): { prefix: string; engine: 'sqlite' | 'postgres'; timestampKey: string; sequence: number; compressed: boolean; encrypted: boolean } | null;
+
 export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, now?: Date): BackupPlan;
 export function restoreBackup(options?: RestoreOptions): RestoreResult;
 export function runBackupJob(options?: BackupOptions): BackupJobResult;

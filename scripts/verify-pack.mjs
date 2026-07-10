@@ -51,7 +51,7 @@ try {
       'createSqliteSnapshot', 'verifySqliteBackupIntegrity', 'restoreSqliteBackup', 'removeSqliteSidecars', 'normalizeRuntime',
       // Encryption at rest + backup liveness (BWK-131).
       'encryptBackupEntry', 'decryptBackupToPath', 'writeSuccessStamp', 'readSuccessStamp', 'checkBackupFreshness',
-      'uploadBackupToRemote', 'pruneRemoteBackups'];
+      'uploadBackupToRemote', 'pruneRemoteBackups', 'parseBackupFileName'];
     const missing = expected.filter((k) => typeof t[k] !== 'function');
     if (missing.length) { throw new Error('missing exports: ' + missing.join(', ')); }
     console.log('[verify-pack] exports OK: ' + expected.join(', '));

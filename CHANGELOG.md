@@ -3,6 +3,32 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.11.0
+
+- **Feature — configurable filename prefix.** `namePrefix` (CLI `--name-prefix`)
+  lets a consumer keep its own backup naming, so a project with an existing
+  backup history can adopt the package instead of orphaning it. smarthome writes
+  `smarthome-<ts>.db.gpg`; without this it would have had to abandon 7 local and
+  30 remote backups to migrate.
+
+  The engine is now read from the **extension** (`.db` → sqlite, `.dump` →
+  postgres) rather than inferred from the prefix, which is unambiguous.
+
+- **`list` / `prune` / `restore` are scoped to the prefix.** One app's backup job
+  can never see or prune another app's backups sharing a directory or a remote
+  bucket.
+
+- **The default is deliberately not widened.** With no `namePrefix`, only the
+  canonical `sqlite-backup` / `postgres-backup` prefixes parse — exactly today's
+  behaviour. Accepting any prefix by default would make an unrelated `.db` file
+  in the backup directory a prune candidate.
+
+`parseBackupFileName(fileName, namePrefix?)` is now exported.
+
+Note: the timestamp grammar is unchanged (`YYYYMMDD-HHMMSSZ`). A consumer whose
+history uses a different timestamp format should rename losslessly at migration
+time rather than have the package carry two grammars.
+
 ## 0.10.1
 
 **Fix — backups were written world-readable (0644).** A backup is a full copy of

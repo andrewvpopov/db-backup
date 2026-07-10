@@ -94,6 +94,7 @@ function parseArgs(argv) {
     cipher: null,
     minBytes: null,
     stampFile: null,
+    namePrefix: null,
     maxAgeHours: 36,
     remoteTarget: null,
     remoteKeep: null,
@@ -211,6 +212,17 @@ function parseArgs(argv) {
         throw new Error('--daily-slots must be an integer >= 0');
       }
       options.dailySlots = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--name-prefix') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --name-prefix');
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) {
+        throw new Error('--name-prefix must be alphanumeric with . _ - (it becomes part of a filename)');
+      }
+      options.namePrefix = value;
       index += 1;
       continue;
     }
@@ -459,20 +471,32 @@ function detectDatabaseEngine(databaseUrl) {
   return 'unknown';
 }
 
-function buildBackupFilename(engine, timestamp, compressSqlite, sequence = 1) {
-  const suffix = sequence > 1 ? `-${sequence}` : '';
-  if (engine === 'sqlite') {
-    return `sqlite-backup-${timestamp}${suffix}.db${compressSqlite ? '.gz' : ''}`;
-  }
-  if (engine === 'postgres') {
-    return `postgres-backup-${timestamp}${suffix}.dump`;
-  }
-  return `db-backup-${engine}-${timestamp}${suffix}.bak`;
+// The canonical prefixes. A consumer with an existing backup history under a
+// different name (smarthome's `smarthome-<ts>.db.gpg`) sets `namePrefix` so the
+// package adopts that history instead of orphaning it. The ENGINE is then read
+// from the extension — `.db` is sqlite, `.dump` is postgres — which is
+// unambiguous and independent of the prefix.
+const CANONICAL_PREFIXES = { sqlite: 'sqlite-backup', postgres: 'postgres-backup' };
+
+function resolveNamePrefix(engine, namePrefix) {
+  return namePrefix || CANONICAL_PREFIXES[engine] || `db-backup-${engine}`;
 }
 
-function buildUniqueBackupPath({ engine, timestamp, outputDir, compressSqlite = false }) {
+function buildBackupFilename(engine, timestamp, compressSqlite, sequence = 1, namePrefix = null) {
+  const suffix = sequence > 1 ? `-${sequence}` : '';
+  const prefix = resolveNamePrefix(engine, namePrefix);
+  if (engine === 'sqlite') {
+    return `${prefix}-${timestamp}${suffix}.db${compressSqlite ? '.gz' : ''}`;
+  }
+  if (engine === 'postgres') {
+    return `${prefix}-${timestamp}${suffix}.dump`;
+  }
+  return `${prefix}-${timestamp}${suffix}.bak`;
+}
+
+function buildUniqueBackupPath({ engine, timestamp, outputDir, compressSqlite = false, namePrefix = null }) {
   for (let sequence = 1; sequence < 1000; sequence += 1) {
-    const fileName = buildBackupFilename(engine, timestamp, compressSqlite, sequence);
+    const fileName = buildBackupFilename(engine, timestamp, compressSqlite, sequence, namePrefix);
     const fullPath = path.join(outputDir, fileName);
 
     if (!fs.existsSync(fullPath)) {
@@ -483,9 +507,9 @@ function buildUniqueBackupPath({ engine, timestamp, outputDir, compressSqlite = 
   throw new Error(`Unable to allocate a unique backup filename for ${engine} at ${timestamp}`);
 }
 
-function buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite }) {
+function buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite, namePrefix = null }) {
   for (let sequence = 1; sequence < 1000; sequence += 1) {
-    const rawFileName = buildBackupFilename('sqlite', timestamp, false, sequence);
+    const rawFileName = buildBackupFilename('sqlite', timestamp, false, sequence, namePrefix);
     const rawFilePath = path.join(outputDir, rawFileName);
     const compressedFilePath = `${rawFilePath}.gz`;
 
@@ -499,30 +523,34 @@ function buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite }
 
 // `.gpg` is the outermost suffix: a backup is snapshotted, then optionally
 // gzipped, then optionally encrypted. Restore unwinds in the reverse order.
-function parseBackupFileName(fileName) {
-  const sqliteMatch = fileName.match(/^sqlite-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.db(\.gz)?(\.gpg)?$/);
-  if (sqliteMatch) {
-    return {
-      engine: 'sqlite',
-      timestampKey: sqliteMatch[1],
-      sequence: sqliteMatch[2] ? Number.parseInt(sqliteMatch[2], 10) : 1,
-      compressed: Boolean(sqliteMatch[3]),
-      encrypted: Boolean(sqliteMatch[4]),
-    };
+//
+// Engine comes from the EXTENSION, not the prefix, so a custom `namePrefix` still
+// parses. Without an explicit prefix only the two canonical ones are accepted —
+// widening the default would make an unrelated file in the backup directory (or
+// another app's backups in a shared remote bucket) a prune candidate.
+const BACKUP_NAME_PATTERN = /^(.+)-(\d{8}-\d{6}Z)(?:-(\d+))?\.(db|dump)(\.gz)?(\.gpg)?$/;
+
+function parseBackupFileName(fileName, namePrefix = null) {
+  const match = fileName.match(BACKUP_NAME_PATTERN);
+  if (!match) {
+    return null;
   }
 
-  const postgresMatch = fileName.match(/^postgres-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.dump(\.gpg)?$/);
-  if (postgresMatch) {
-    return {
-      engine: 'postgres',
-      timestampKey: postgresMatch[1],
-      sequence: postgresMatch[2] ? Number.parseInt(postgresMatch[2], 10) : 1,
-      compressed: false,
-      encrypted: Boolean(postgresMatch[3]),
-    };
+  const [, prefix, timestampKey, sequence, extension, gz, gpg] = match;
+  const engine = extension === 'db' ? 'sqlite' : 'postgres';
+  const expected = namePrefix || CANONICAL_PREFIXES[engine];
+  if (prefix !== expected) {
+    return null;
   }
 
-  return null;
+  return {
+    prefix,
+    engine,
+    timestampKey,
+    sequence: sequence ? Number.parseInt(sequence, 10) : 1,
+    compressed: Boolean(gz),
+    encrypted: Boolean(gpg),
+  };
 }
 
 function loadEnvironment({
@@ -652,6 +680,7 @@ function resolveBackupOptions(options = {}) {
   const encryption = options.encryption || null;
   const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
   const stampFile = options.stampFile || null;
+  const namePrefix = options.namePrefix || null;
   const remote = options.remote || null;
   const skipRemote = options.skipRemote === true;
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
@@ -680,6 +709,7 @@ function resolveBackupOptions(options = {}) {
     encryption,
     minBytes,
     stampFile,
+    namePrefix,
     remote,
     skipRemote,
     policy,
@@ -961,7 +991,7 @@ function createSqliteSnapshot({
   return restrictArtifact(destPath);
 }
 
-function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime(), allowUnsafeCopy = false }) {
+function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime(), allowUnsafeCopy = false, namePrefix = null }) {
   now = now || runtime.now();
   const sourcePath = parseSqlitePath(databaseUrl, cwd);
   if (!fs.existsSync(sourcePath)) {
@@ -969,7 +999,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   }
 
   const timestamp = formatTimestamp(now);
-  const { rawFilePath } = buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite });
+  const { rawFilePath } = buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite, namePrefix });
 
   createSqliteSnapshot({ sourcePath, destPath: rawFilePath, runtime, allowUnsafeCopy });
 
@@ -994,7 +1024,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   };
 }
 
-function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalizeRuntime() }) {
+function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalizeRuntime(), namePrefix = null }) {
   now = now || runtime.now();
   if (!runtime.commandExists('pg_dump')) {
     throw new Error('pg_dump is required for PostgreSQL backups but is not installed.');
@@ -1005,6 +1035,7 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     engine: 'postgres',
     timestamp,
     outputDir,
+    namePrefix,
   });
   runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, databaseUrl], { stdio: 'inherit' });
   restrictArtifact(fullPath);
@@ -1048,6 +1079,7 @@ function createBackup(options = {}) {
       now,
       runtime: resolved.runtime,
       allowUnsafeCopy: resolved.allowUnsafeCopy,
+      namePrefix: resolved.namePrefix,
     }));
   }
 
@@ -1058,6 +1090,7 @@ function createBackup(options = {}) {
         outputDir: resolved.outputDir,
         now,
         runtime: resolved.runtime,
+        namePrefix: resolved.namePrefix,
       })
     );
   }
@@ -1065,13 +1098,13 @@ function createBackup(options = {}) {
   throw new Error('Unsupported DATABASE_URL scheme. Expected file:, postgres://, or postgresql://');
 }
 
-function getBackupEntryFromPath(backupPath, now = new Date()) {
+function getBackupEntryFromPath(backupPath, now = new Date(), namePrefix = null) {
   if (!fs.existsSync(backupPath)) {
     throw new Error(`Backup file not found: ${backupPath}`);
   }
 
   const fileName = path.basename(backupPath);
-  const parsed = parseBackupFileName(fileName);
+  const parsed = parseBackupFileName(fileName, namePrefix);
   if (!parsed) {
     throw new Error(`Unsupported backup filename format: ${fileName}`);
   }
@@ -1100,6 +1133,7 @@ function resolveRestoreBackup({
   useLatest = false,
   outputDir = DEFAULT_OUTPUT_DIR,
   now = new Date(),
+  namePrefix = null,
 } = {}) {
   const absoluteOutputDir = path.resolve(outputDir);
 
@@ -1107,11 +1141,11 @@ function resolveRestoreBackup({
     const candidatePath = path.isAbsolute(backupFile)
       ? backupFile
       : path.resolve(absoluteOutputDir, backupFile);
-    return getBackupEntryFromPath(candidatePath, now);
+    return getBackupEntryFromPath(candidatePath, now, namePrefix);
   }
 
   if (useLatest) {
-    const backups = listBackups({ outputDir: absoluteOutputDir, now });
+    const backups = listBackups({ outputDir: absoluteOutputDir, now, namePrefix });
     if (backups.length === 0) {
       throw new Error(`No backups found in: ${absoluteOutputDir}`);
     }
@@ -1284,6 +1318,7 @@ function restoreBackup(options = {}) {
     useLatest: options.useLatest,
     outputDir: resolved.outputDir,
     now,
+    namePrefix: resolved.namePrefix,
   });
   const databaseEngine = detectDatabaseEngine(resolved.databaseUrl);
 
@@ -1343,7 +1378,7 @@ function restoreBackup(options = {}) {
   };
 }
 
-function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date() } = {}) {
+function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date(), namePrefix = null } = {}) {
   const absoluteOutputDir = path.resolve(outputDir);
   if (!fs.existsSync(absoluteOutputDir)) {
     return [];
@@ -1351,7 +1386,7 @@ function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date() } = {}) 
 
   const files = fs.readdirSync(absoluteOutputDir)
     .map((fileName) => {
-      const parsed = parseBackupFileName(fileName);
+      const parsed = parseBackupFileName(fileName, namePrefix);
       if (!parsed) {
         return null;
       }
@@ -1547,7 +1582,7 @@ function pruneBackups(backupsToRemove = []) {
 function listBackupsWithPlan(options = {}) {
   const resolved = resolveBackupOptions({ ...options, requireDatabaseUrl: false });
   const now = resolved.runtime.now();
-  const backups = listBackups({ outputDir: resolved.outputDir, now });
+  const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
   const plan = planRetention(backups, resolved.policy, now);
 
   const keepNames = new Set(plan.keep.map((entry) => entry.fileName));
@@ -1673,7 +1708,7 @@ function pruneBackupsJob(options = {}) {
   }
 
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
-    const backups = listBackups({ outputDir: resolved.outputDir, now });
+    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
     const plan = planRetention(backups, resolved.policy, now);
     const removed = pruneBackups(plan.remove);
 
@@ -1766,7 +1801,7 @@ function uploadBackupToRemote(entry, remote, runtime) {
 // we just uploaded and verified — same clock-rollback protection as the local
 // prune. A prune failure is a cleanup miss, not a data-safety issue: the new
 // backup is already verified on both ends, so warn and carry on.
-function pruneRemoteBackups(remote, protectFileName, runtime) {
+function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null) {
   const keep = Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP);
   let listing = '';
   try {
@@ -1784,7 +1819,7 @@ function pruneRemoteBackups(remote, protectFileName, runtime) {
   const candidates = listing
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((name) => name && name !== protectFileName && parseBackupFileName(name))
+    .filter((name) => name && name !== protectFileName && parseBackupFileName(name, namePrefix))
     .sort()
     .reverse();
 
@@ -1858,7 +1893,7 @@ function runBackupJob(options = {}) {
       uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
     }
 
-    const backups = listBackups({ outputDir: resolved.outputDir, now });
+    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
     const plan = planRetention(backups, resolved.policy, now);
 
     // NEVER prune the backup we just created and verified, whatever the plan
@@ -1873,7 +1908,7 @@ function runBackupJob(options = {}) {
     // so a stray old copy is a cleanup miss, not a data-safety issue.
     const removedRemote =
       uploaded && resolved.remote
-        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime)
+        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime, resolved.namePrefix)
         : [];
 
     // Best-effort: a manifest write failure must never fail the backup itself.
@@ -1971,6 +2006,7 @@ Options:
   --encrypt-passphrase-file <path>  Encrypt the backup (gpg symmetric AES256)
   --cipher <algo>         gpg cipher algorithm (default: AES256)
   --min-bytes <n>         Discard and fail if the backup is smaller than n bytes
+  --name-prefix <name>    Filename prefix (default sqlite-backup / postgres-backup)
   --stamp-file <path>     Write .last-success only after a fully successful run
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
   --remote <dest>         Upload off-host via rclone and verify (e.g. remote:path)
@@ -2066,6 +2102,7 @@ function runCli(argv = process.argv.slice(2)) {
       : null,
     minBytes: options.minBytes,
     stampFile: options.stampFile,
+    namePrefix: options.namePrefix,
     remote: options.remoteTarget
       ? {
           target: options.remoteTarget,
@@ -2196,6 +2233,7 @@ module.exports = {
   // `sqlite3 .backup` — they carry the lock retries, quote escaping, WAL guard,
   // integrity verification, atomic replace, and sidecar cleanup.
   createSqliteSnapshot,
+  parseBackupFileName,
   verifySqliteBackupIntegrity,
   restoreSqliteBackup,
   removeSqliteSidecars,
