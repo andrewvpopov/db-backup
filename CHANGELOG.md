@@ -3,6 +3,30 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.8.1
+
+**Fix — the destination path is now correctly quoted for sqlite3's `.backup`
+dot-command.** A snapshot to a path containing a single quote failed outright and
+produced no file.
+
+`createSqliteSnapshot` escaped the destination with `path.replace(/'/g, "''")`,
+on the assumption that doubling a single quote escapes it. It does not: a sqlite3
+dot-command is **not SQL**, and the shell tokenizes its arguments with shell-like
+quoting rather than SQL string-literal quoting. `.backup 'o''brien/x.db'` fails
+with `cannot open "brien/x.db"`.
+
+Verified against the real `sqlite3` binary: a **double-quoted** argument works,
+accepting `\"` and `\\` as escapes and handling spaces and single quotes
+verbatim. Paths are now wrapped in double quotes with `\` and `"` escaped.
+
+This was never a regression — the hand-rolled consumer code it replaced failed on
+the same input — but v0.7.0's release notes and README advertised "quote escaping"
+as a safety property consumers gain, which was not true. Now it is.
+
+Covered by a unit test pinning the argv for quotes, spaces, double quotes and
+backslashes, plus an integration test that snapshots through the **real** sqlite3
+binary to a path containing a quote. Both fail against the old escaping.
+
 ## 0.8.0
 
 **BREAKING (behavioral) — `verifySqliteBackupIntegrity` no longer deletes the file

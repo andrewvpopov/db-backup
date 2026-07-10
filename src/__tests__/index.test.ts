@@ -138,7 +138,7 @@ describe('@andrewpopov/db-backup', () => {
         }
         if (command === 'sqlite3') {
           const backupCommand = args[3];
-          const match = backupCommand.match(/^\.backup '(.+)'$/);
+          const match = backupCommand.match(/^\.backup "(.+)"$/);
           if (!match) throw new Error(`Unexpected sqlite backup command: ${backupCommand}`);
           fs.writeFileSync(match[1].replace(/''/g, "'"), 'sqlite backup from command');
         }
@@ -163,7 +163,7 @@ describe('@andrewpopov/db-backup', () => {
     expect(calls).toEqual([
       {
         command: 'sqlite3',
-        args: ['-cmd', '.timeout 5000', sourcePath, `.backup '${rawPath}'`],
+        args: ['-cmd', '.timeout 5000', sourcePath, `.backup "${rawPath}"`],
       },
       {
         command: 'sqlite3',
@@ -189,7 +189,7 @@ describe('@andrewpopov/db-backup', () => {
           return Buffer.from('*** in database main ***\nrow 1 missing from index idx');
         }
         if (command === 'sqlite3') {
-          const match = String(args[3]).match(/^\.backup '(.+)'$/);
+          const match = String(args[3]).match(/^\.backup "(.+)"$/);
           fs.writeFileSync(match![1].replace(/''/g, "'"), 'corrupt backup');
         }
         return undefined;
@@ -717,26 +717,63 @@ describe('@andrewpopov/db-backup', () => {
     ).toThrow(/sqlite3.*unavailable|allowUnsafeCopy/s);
   });
 
-  it('createSqliteSnapshot escapes single quotes in the destination path', () => {
+  it('createSqliteSnapshot really writes to a path containing a quote, via real sqlite3 (BWK-130)', () => {
+    // The unit test above pins the argv we build; this one proves the real
+    // sqlite3 binary accepts it. The old `''` escaping failed here with
+    // `cannot open "brien/snap.db"` and produced no file at all.
+    const dir = makeTempDir();
+    const sourcePath = path.join(dir, 'app.db');
+    const quotedDir = path.join(dir, "o'brien dir");
+    const destPath = path.join(quotedDir, 'snap.db');
+    fs.mkdirSync(quotedDir, { recursive: true });
+
+    const realRuntime = normalizeRuntime();
+    if (!realRuntime.commandExists('sqlite3')) return; // sqlite3 unavailable
+
+    realRuntime.execFileSync('sqlite3', [sourcePath, "CREATE TABLE t(v); INSERT INTO t VALUES('x');"], { stdio: 'pipe' });
+
+    createSqliteSnapshot({ sourcePath, destPath, runtime: realRuntime });
+
+    expect(fs.existsSync(destPath), 'snapshot must exist at the quoted path').toBe(true);
+    const rows = realRuntime
+      .execFileSync('sqlite3', [destPath, 'SELECT group_concat(v) FROM t;'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      .toString()
+      .trim();
+    expect(rows).toBe('x');
+  });
+
+  it('createSqliteSnapshot quotes the destination path for the sqlite3 dot-command (BWK-130)', () => {
+    // A dot-command is NOT SQL: sqlite3 tokenizes its arguments with shell-like
+    // quoting. Doubling a single quote (the SQL escape) does not work here and
+    // silently truncates the path. Verified against sqlite3: double-quote the
+    // argument and backslash-escape `\` and `"`.
     const dir = makeTempDir();
     const sourcePath = path.join(dir, 'app.db');
     fs.writeFileSync(sourcePath, 'db');
-    const captured: string[][] = [];
 
-    createSqliteSnapshot({
-      sourcePath,
-      destPath: "/tmp/o'brien/snap.db",
-      runtime: makeRuntime({
-        commandExists: () => true,
-        execFileSync: ((_c: string, args: string[]) => {
-          captured.push(args);
-          return Buffer.from('ok');
-        }) as never,
-      }),
-    });
+    const cases: Array<[string, string]> = [
+      ["/tmp/o'brien/snap.db", '.backup "/tmp/o\'brien/snap.db"'],
+      ['/tmp/with space/snap.db', '.backup "/tmp/with space/snap.db"'],
+      ['/tmp/say"hi/snap.db', '.backup "/tmp/say\\"hi/snap.db"'],
+      ['/tmp/back\\slash/snap.db', '.backup "/tmp/back\\\\slash/snap.db"'],
+    ];
 
-    const backupArg = captured[0].find((a) => a.startsWith('.backup'));
-    expect(backupArg).toContain("o''brien");
+    for (const [destPath, expected] of cases) {
+      const captured: string[][] = [];
+      createSqliteSnapshot({
+        sourcePath,
+        destPath,
+        runtime: makeRuntime({
+          commandExists: () => true,
+          execFileSync: ((_c: string, args: string[]) => {
+            captured.push(args);
+            return Buffer.from('ok');
+          }) as never,
+        }),
+      });
+      const backupArg = captured[0].find((a) => a.startsWith('.backup'));
+      expect(backupArg, `destPath ${destPath}`).toBe(expected);
+    }
   });
 
 
@@ -1189,7 +1226,7 @@ describe('@andrewpopov/db-backup', () => {
             error.stderr = Buffer.from('Error: database is locked');
             throw error;
           }
-          const match = String(args[3]).match(/^\.backup '(.+)'$/);
+          const match = String(args[3]).match(/^\.backup "(.+)"$/);
           fs.writeFileSync(match![1].replace(/''/g, "'"), 'backup bytes');
         }
         return undefined;
