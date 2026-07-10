@@ -1862,18 +1862,31 @@ function readSuccessStamp(stampFile) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-// Returns { fresh, stampedAt, ageHours, maxAgeHours }. A missing or unparseable
-// stamp is NOT fresh — absence of evidence is not evidence of a backup.
+// Returns { fresh, clockSkew, stampedAt, ageHours, maxAgeHours }.
+//
+// A missing or unparseable stamp is NOT fresh — absence of evidence is not
+// evidence of a backup.
+//
+// A stamp dated in the FUTURE is not fresh either, and is reported distinctly as
+// a clock problem. Otherwise its negative age would always sit under the
+// threshold and the monitor would report "fresh" forever, even with backups
+// stopped. That is not hypothetical: it is the same clock-rollback failure mode
+// this package already guards against in retention. A host whose clock jumps
+// forward once stamps a future date and blinds the monitor permanently.
+// Absorbed from smarthome's check-backup-freshness.sh (BWK-135).
 function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } = {}) {
   if (!stampFile) {
     throw new Error('stampFile is required to check backup freshness');
   }
   const stampedAt = readSuccessStamp(stampFile);
   if (!stampedAt) {
-    return { fresh: false, stampedAt: null, ageHours: null, maxAgeHours };
+    return { fresh: false, clockSkew: false, stampedAt: null, ageHours: null, maxAgeHours };
   }
   const ageHours = (now.getTime() - stampedAt.getTime()) / (60 * 60 * 1000);
-  return { fresh: ageHours <= maxAgeHours, stampedAt, ageHours, maxAgeHours };
+  if (ageHours < 0) {
+    return { fresh: false, clockSkew: true, stampedAt, ageHours, maxAgeHours };
+  }
+  return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
 }
 
 function runBackupJob(options = {}) {
@@ -2047,6 +2060,11 @@ function runCli(argv = process.argv.slice(2)) {
       console.log(JSON.stringify(status, null, 2));
     } else if (!status.stampedAt) {
       console.error(`[db-backup] no successful backup recorded at ${options.stampFile}`);
+    } else if (status.clockSkew) {
+      console.error(
+        `[db-backup] CLOCK PROBLEM: .last-success is dated in the future (${status.stampedAt.toISOString()}); ` +
+          'refusing to report the backup as fresh'
+      );
     } else {
       const age = status.ageHours.toFixed(1);
       const line = `last successful backup is ${age}h old (threshold ${status.maxAgeHours}h), stamped ${status.stampedAt.toISOString()}`;

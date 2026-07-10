@@ -62,6 +62,9 @@ export interface BackupUploadResult {
 
 export interface BackupFreshness {
   fresh: boolean;
+  /** The stamp is dated in the future — a clock problem, not a stale backup.
+   * `fresh` is false. Reported separately so an operator can tell them apart. */
+  clockSkew: boolean;
   /** null when no successful backup has ever been recorded. */
   stampedAt: Date | null;
   ageHours: number | null;
