@@ -20,6 +20,7 @@ const {
   appendBackupManifestEntry,
   createSqliteSnapshot,
   verifySqliteBackupIntegrity,
+  parseBackupFileName,
   checkBackupFreshness,
   writeSuccessStamp,
   normalizeRuntime,
@@ -1171,6 +1172,98 @@ describe('@andrewpopov/db-backup', () => {
     });
 
     expect(fs.statSync(outputDir).mode & 0o777, 'existing dir mode preserved').toBe(0o750);
+  });
+
+
+  it('a custom namePrefix names, lists, prunes and restores its own backups (BWK-133)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    const result = runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+      compressSqlite: false, namePrefix: 'smarthome', runtime: makeRuntime(),
+    });
+
+    expect(result.created.fileName).toBe('smarthome-20260705-150000Z.db');
+    // Engine still resolves — it comes from the `.db` extension, not the prefix.
+    expect(result.created.engine).toBe('sqlite');
+
+    const listed = listBackupsWithPlan({ cwd, outputDir, namePrefix: 'smarthome', runtime: makeRuntime() });
+    expect(listed.backups.map((b) => b.fileName)).toEqual(['smarthome-20260705-150000Z.db']);
+  });
+
+  it('prefix scoping: a job never sees or prunes another app\u2019s backups (BWK-133)', () => {
+    // A shared backup directory (or remote bucket) must not let app A prune app B.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    fs.writeFileSync(path.join(outputDir, 'otherapp-20260101-000000Z.db'), 'foreign');
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260101-000000Z.db'), 'canonical');
+    fs.writeFileSync(path.join(outputDir, 'notes.db'), 'not a backup');
+
+    // keep-last:1 would prune everything it can see.
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+      compressSqlite: false, namePrefix: 'smarthome',
+      policy: { mode: 'keep-last', keepLast: 1 }, runtime: makeRuntime(),
+    });
+
+    for (const survivor of ['otherapp-20260101-000000Z.db', 'sqlite-backup-20260101-000000Z.db', 'notes.db']) {
+      expect(fs.existsSync(path.join(outputDir, survivor)), `${survivor} must survive`).toBe(true);
+    }
+  });
+
+  it('without namePrefix, only the canonical prefixes are recognised (no widening)', () => {
+    expect(parseBackupFileName('sqlite-backup-20260705-150000Z.db')).toMatchObject({ engine: 'sqlite' });
+    expect(parseBackupFileName('postgres-backup-20260705-150000Z.dump')).toMatchObject({ engine: 'postgres' });
+    // A foreign prefix must NOT parse by default.
+    expect(parseBackupFileName('smarthome-20260705-150000Z.db')).toBeNull();
+    expect(parseBackupFileName('otherapp-20260705-150000Z.db')).toBeNull();
+    // ...but does with the prefix supplied.
+    expect(parseBackupFileName('smarthome-20260705-150000Z.db', 'smarthome')).toMatchObject({
+      engine: 'sqlite', prefix: 'smarthome',
+    });
+    // Engine comes from the extension.
+    expect(parseBackupFileName('smarthome-20260705-150000Z.dump', 'smarthome')).toMatchObject({ engine: 'postgres' });
+    // And the canonical prefix must not parse when a different one is expected.
+    expect(parseBackupFileName('sqlite-backup-20260705-150000Z.db', 'smarthome')).toBeNull();
+  });
+
+  it('remote prune is scoped to the configured prefix', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const deleted: string[] = [];
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) => {
+        if (args[0] === 'lsjson') {
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('smarthome-'))!;
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
+        }
+        if (args[0] === 'lsf') {
+          // A shared bucket holding two apps' backups.
+          return Buffer.from(
+            ['smarthome-20260101-000000Z.db', 'smarthome-20260102-000000Z.db', 'otherapp-20260101-000000Z.db'].join('\n'),
+          );
+        }
+        if (args[0] === 'deletefile') deleted.push(String(args[1]));
+        return Buffer.from('');
+      }) as never,
+    });
+
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      namePrefix: 'smarthome', runtime, remote: { target: 'offsite:shared', keep: 1 },
+    });
+
+    expect(deleted.some((d) => d.includes('otherapp')), 'must never prune another app').toBe(false);
+    expect(deleted.some((d) => d.includes('smarthome-2026010'))).toBe(true);
   });
 
   it('lists only supported backup filenames and annotates retention decisions', () => {

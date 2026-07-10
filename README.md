@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.10.1
+npm install github:andrewpopov/db-backup#v0.11.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**
@@ -65,6 +65,20 @@ the plaintext. The passphrase is read from a **file**, never passed as an argume
 (arguments are visible in the process table). If `gpg` is unavailable the backup
 **fails** rather than silently writing plaintext. `restore` decrypts transparently
 and refuses without the passphrase.
+
+## Filename prefix
+
+```bash
+db-backup backup --prod --name-prefix smarthome     # smarthome-<ts>.db.gz.gpg
+```
+
+Defaults to `sqlite-backup` / `postgres-backup`. Set it to adopt an existing
+backup history written under another name. The engine is read from the extension
+(`.db` / `.dump`), not the prefix.
+
+`list`, `prune` and `restore` are **scoped to the prefix**, so one app's job can
+never prune another app's backups in a shared directory or remote bucket. With no
+prefix set, only the canonical names are recognised — the default is not widened.
 
 ## Off-host replication
 

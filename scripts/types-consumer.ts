@@ -17,6 +17,7 @@ import {
   writeSuccessStamp,
   uploadBackupToRemote,
   pruneRemoteBackups,
+  parseBackupFileName,
   DEFAULT_CIPHER_ALGO,
   restoreSqliteBackup,
   removeSqliteSidecars,
@@ -212,3 +213,10 @@ const _prunedRemote: string[] | undefined = offsiteJob.removedRemote;
 runBackupJob({ mode: 'prod', outputDir: '/var/lib/app/backups', remote, skipRemote: true });
 
 export const _remoteContract = { remote, _uploadedTo, _prunedRemote };
+
+// Filename prefix (BWK-133): adopt an existing backup history.
+runBackupJob({ mode: 'prod', outputDir: '/var/lib/app/backups', namePrefix: 'smarthome' });
+const _parsedCustom = parseBackupFileName('smarthome-20260705-150000Z.db.gz.gpg', 'smarthome');
+const _engine: 'sqlite' | 'postgres' | undefined = _parsedCustom?.engine;
+const _foreign: null = parseBackupFileName('otherapp-20260705-150000Z.db') as null;
+export const _prefixContract = { _engine, _foreign };
