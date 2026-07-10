@@ -346,6 +346,63 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(path.join(path.dirname(dbPath), '.restore-fixed-restore-id.db'))).toBe(false);
   });
 
+  it('restore discards the old database’s -wal/-shm/-journal sidecars', () => {
+    // Regression (BWK-118): the sidecars describe the database being REPLACED.
+    // Left on disk, SQLite replays the old WAL's frames onto the restored file
+    // on next open — silently resurrecting pre-restore rows, while
+    // `PRAGMA integrity_check` still reports "ok".
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old database');
+    fs.writeFileSync(backupPath, 'restored database');
+
+    // Sidecars from the pre-restore database, as a crashed writer would leave.
+    const sidecars = ['-wal', '-shm', '-journal'].map((suffix) => `${dbPath}${suffix}`);
+    sidecars.forEach((file) => fs.writeFileSync(file, 'stale frames from the OLD database'));
+
+    restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+    for (const file of sidecars) {
+      expect(fs.existsSync(file), `${path.basename(file)} must not survive a restore`).toBe(false);
+    }
+  });
+
+  it('restore succeeds when the database has no sidecars to remove', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(backupPath, 'restored database');
+    // No pre-existing database file at all — removal must be a no-op, not a throw.
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      allowMissing: true,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+  });
+
   it('plans retention with recent daily slots plus anchor backups', () => {
     const backups = [
       backupEntry('day-0.db.gz', 0),
