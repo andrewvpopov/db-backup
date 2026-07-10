@@ -651,6 +651,18 @@ function sha256File(filePath) {
   return hash.digest('hex');
 }
 
+// A sqlite3 dot-command (`.backup <path>`) is not SQL: the shell tokenizes its
+// arguments with SHELL-like quoting, not SQL string-literal quoting. Doubling a
+// single quote — the SQL escape — does NOT work here; `.backup 'o''brien/x.db'`
+// fails with `cannot open "brien/x.db"`.
+//
+// Verified against sqlite3: a double-quoted argument accepts `\"` and `\\`, and
+// handles spaces and single quotes verbatim. So wrap in double quotes and escape
+// backslashes and double quotes.
+function quoteDotCommandArg(value) {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 // The SQLite snapshot ENGINE, decoupled from filename/manifest/retention policy.
 // Consumers that need to choose their own destination path (an admin "back up
 // now" route, a pre-deploy hook) should call this directly rather than
@@ -697,8 +709,7 @@ function createSqliteSnapshot({
   // `.backup` is the online backup API: WAL-safe, consistent, and it will not
   // tear under a concurrent writer. Single quotes are doubled because the path
   // is interpolated into a sqlite3 dot-command, not passed as an argv element.
-  const escapedDestPath = destPath.replace(/'/g, "''");
-  const sqliteArgs = ['-cmd', '.timeout 5000', sourcePath, `.backup '${escapedDestPath}'`];
+  const sqliteArgs = ['-cmd', '.timeout 5000', sourcePath, `.backup ${quoteDotCommandArg(destPath)}`];
   const maxAttempts = 5;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
