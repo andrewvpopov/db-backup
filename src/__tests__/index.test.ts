@@ -2031,26 +2031,27 @@ describe('@andrewpopov/db-backup', () => {
 });
 
 describe('checkRemoteFreshness (off-host dead-man switch)', () => {
-  const at = (hoursFromNow: number) =>
-    new Date(fixedNow.getTime() + hoursFromNow * 3600_000).toISOString();
-  const rcloneRuntime = (
-    entries: Array<{ Path: string; ModTime: string; IsDir?: boolean }>,
-  ) =>
+  const pad = (n: number) => String(n).padStart(2, '0');
+  // A canonical sqlite backup filename dated `hoursFromNow` from fixedNow.
+  const bkname = (hoursFromNow: number) => {
+    const d = new Date(fixedNow.getTime() + hoursFromNow * 3600_000);
+    const key = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+    return `sqlite-backup-${key}.db.gz`;
+  };
+  // Mirrors the real path: rclone lsf --files-only returns newline-joined names.
+  const rcloneRuntime = (names: string[]) =>
     makeRuntime({
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((command: string, args: string[]) =>
-        command === 'rclone' && args[0] === 'lsjson'
-          ? Buffer.from(JSON.stringify(entries))
+        command === 'rclone' && args[0] === 'lsf'
+          ? Buffer.from(names.join('\n') + '\n')
           : Buffer.from('')) as never,
     });
 
-  it('is fresh when the newest remote object is within the threshold', () => {
+  it('is fresh when the newest backup is within the threshold', () => {
     const s = checkRemoteFreshness({
       remote: { target: 'r2:b/p' },
-      runtime: rcloneRuntime([
-        { Path: 'old.db.gz', ModTime: at(-30) },
-        { Path: 'new.db.gz', ModTime: at(-2) },
-      ]),
+      runtime: rcloneRuntime([bkname(-30), bkname(-2)]),
       maxAgeHours: 24,
       now: fixedNow,
     });
@@ -2058,17 +2059,17 @@ describe('checkRemoteFreshness (off-host dead-man switch)', () => {
     expect(s.ageHours).toBeCloseTo(2, 5);
   });
 
-  it('is not fresh when the newest object is older than the threshold', () => {
+  it('is not fresh when the newest backup is older than the threshold', () => {
     const s = checkRemoteFreshness({
       remote: { target: 'r2:b/p' },
-      runtime: rcloneRuntime([{ Path: 'x.db.gz', ModTime: at(-48) }]),
+      runtime: rcloneRuntime([bkname(-48)]),
       maxAgeHours: 24,
       now: fixedNow,
     });
     expect(s.fresh).toBe(false);
   });
 
-  it('is not fresh (stampedAt null) when the remote is empty', () => {
+  it('is not fresh (stampedAt null) when the remote has no backups', () => {
     const s = checkRemoteFreshness({
       remote: { target: 'r2:b/p' },
       runtime: rcloneRuntime([]),
@@ -2078,27 +2079,26 @@ describe('checkRemoteFreshness (off-host dead-man switch)', () => {
     expect(s).toMatchObject({ fresh: false, stampedAt: null });
   });
 
-  it('flags a future ModTime as a clock problem, not fresh', () => {
+  it('flags a future-dated backup as a clock problem, not fresh', () => {
     const s = checkRemoteFreshness({
       remote: { target: 'r2:b/p' },
-      runtime: rcloneRuntime([{ Path: 'x.db.gz', ModTime: at(2) }]),
+      runtime: rcloneRuntime([bkname(2)]),
       maxAgeHours: 24,
       now: fixedNow,
     });
     expect(s).toMatchObject({ fresh: false, clockSkew: true });
   });
 
-  it('ignores directories when picking the newest object', () => {
+  it('ignores stray non-backup files (a fresh manifest cannot mask a stale backup)', () => {
     const s = checkRemoteFreshness({
       remote: { target: 'r2:b/p' },
-      runtime: rcloneRuntime([
-        { Path: 'today', ModTime: at(-1), IsDir: true },
-        { Path: 'x.db.gz', ModTime: at(-40) },
-      ]),
+      // a newer non-backup file plus a 40h-old real backup → stale
+      runtime: rcloneRuntime(['backup-manifest.json', 'random.txt', bkname(-40)]),
       maxAgeHours: 24,
       now: fixedNow,
     });
-    expect(s.fresh).toBe(false); // the fresh entry is a directory; the only file is 40h old
+    expect(s.fresh).toBe(false);
+    expect(s.ageHours).toBeCloseTo(40, 5);
   });
 
   it('throws when rclone is unavailable — a check that cannot run is not "fresh"', () => {
@@ -2110,6 +2110,22 @@ describe('checkRemoteFreshness (off-host dead-man switch)', () => {
         now: fixedNow,
       }),
     ).toThrow(/rclone.*unavailable/i);
+  });
+
+  it('throws when the listing itself fails (UNKNOWN is never fresh)', () => {
+    expect(() =>
+      checkRemoteFreshness({
+        remote: { target: 'r2:b/p' },
+        runtime: makeRuntime({
+          commandExists: (c: string) => c === 'rclone',
+          execFileSync: (() => {
+            throw new Error('rclone: network unreachable');
+          }) as never,
+        }),
+        maxAgeHours: 24,
+        now: fixedNow,
+      }),
+    ).toThrow(/Could not list remote backups/i);
   });
 });
 
