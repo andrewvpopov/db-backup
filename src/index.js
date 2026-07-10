@@ -789,6 +789,18 @@ function redactDatabaseUrl(databaseUrl) {
   }
 }
 
+// SQLite writes its journal beside the database file. `-wal`/`-shm` are used in
+// WAL mode, `-journal` in the default rollback mode. They describe the database
+// they were created for, so they must be discarded whenever that database file
+// is replaced wholesale.
+const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'];
+
+function removeSqliteSidecars(databasePath) {
+  for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+    fs.rmSync(`${databasePath}${suffix}`, { force: true });
+  }
+}
+
 function restoreSqliteBackup({
   databaseUrl,
   backupEntry,
@@ -822,6 +834,13 @@ function restoreSqliteBackup({
     if (fs.existsSync(destinationPath)) {
       fs.unlinkSync(destinationPath);
     }
+
+    // The `-wal`/`-shm`/`-journal` sidecars belong to the database we just
+    // deleted. Left in place, SQLite replays the old WAL's frames onto the
+    // restored file on the next open — silently resurrecting pre-restore rows
+    // while `PRAGMA integrity_check` still reports "ok". The snapshot is a
+    // complete database, so the old sidecars are never wanted.
+    removeSqliteSidecars(destinationPath);
 
     fs.renameSync(tempPath, destinationPath);
   } catch (error) {

@@ -3,6 +3,20 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.6.1
+
+**Fix — SQLite restore silently resurrected pre-restore data.** `restoreSqliteBackup`
+replaced the live database file but left its `-wal` / `-shm` sidecars on disk. Those
+journals describe the database being *replaced*, so if the app had crashed (or was
+still running) with un-checkpointed WAL frames, SQLite replayed those frames onto the
+restored file on the next open — reviving rows that were never in the backup, while
+`PRAGMA integrity_check` still reported `ok`. The package's own integrity assertion
+did not catch it, because it validates the temp file *before* the rename.
+
+Restoring now discards the destination's `-wal`, `-shm`, and `-journal` sidecars
+before the replacement file is moved into place. Covered by a regression test that
+plants stale sidecars and asserts they do not survive a restore.
+
 ## 0.6.0
 
 Flat retention modes. Additive — the age-tier default is unchanged, including
