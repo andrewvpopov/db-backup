@@ -1,6 +1,6 @@
 # Shared Package Standards
 
-> **Canonical source:** `agent_tools/knowledge/shared-package-standards.md`.
+> **Canonical source:** `agent_brain/knowledge/shared-package-standards.md`.
 > This file is a synced copy; change the canonical doc first.
 
 Reference for every `andrewpopov/*` package consumed across bewks, stoki,
