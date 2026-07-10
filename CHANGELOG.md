@@ -3,6 +3,29 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.11.1
+
+**Fix — a future-dated `.last-success` stamp reported the backup as fresh, forever.**
+
+`checkBackupFreshness` computed `ageHours = now - stampedAt` and returned fresh
+when that was under the threshold. A stamp dated in the **future** yields a
+negative age, which is always under the threshold — so the monitor reported fresh
+even with backups stopped entirely.
+
+Not hypothetical: it is the same clock-rollback failure mode this package already
+guards against in retention (never prune the backup you just created, because a
+host whose clock jumped backward gives the new file an older timestamp). A host
+whose clock jumps *forward* once stamps a future date and blinds the monitor
+permanently.
+
+A future stamp is now **never fresh**, and is reported distinctly as
+`clockSkew: true` so an operator can tell a clock problem from a stale backup.
+The CLI says `CLOCK PROBLEM: .last-success is dated in the future` and exits
+non-zero.
+
+Absorbed from smarthome's `check-backup-freshness.sh`, found while migrating it
+onto the package (SMH-157) — migrating without this would have been a regression.
+
 ## 0.11.0
 
 - **Feature — configurable filename prefix.** `namePrefix` (CLI `--name-prefix`)

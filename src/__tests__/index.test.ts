@@ -942,6 +942,28 @@ describe('@andrewpopov/db-backup', () => {
     expect(checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow }).fresh).toBe(false);
   });
 
+  it('a future-dated stamp is a clock problem, not a fresh backup (BWK-135)', () => {
+    // Negative age would otherwise always sit under the threshold, so a host
+    // whose clock jumped forward once would report "fresh" forever — even with
+    // backups stopped. Same clock-skew failure mode the retention guard covers.
+    const dir = makeTempDir();
+    const stampFile = path.join(dir, '.last-success');
+
+    writeSuccessStamp(stampFile, new Date(fixedNow.getTime() + 6 * 60 * 60 * 1000));
+    const status = checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow });
+
+    expect(status.fresh, 'a future stamp must never read as fresh').toBe(false);
+    expect(status.clockSkew, 'and must be reported as a clock problem').toBe(true);
+    expect(status.ageHours).toBeLessThan(0);
+
+    // A normal stamp is not a clock problem.
+    writeSuccessStamp(stampFile, new Date(fixedNow.getTime() - 60 * 60 * 1000));
+    expect(checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow })).toMatchObject({
+      fresh: true,
+      clockSkew: false,
+    });
+  });
+
   it('encryption refuses rather than writing an unencrypted backup when gpg is missing', () => {
     const dir = makeTempDir();
     const passphraseFile = path.join(dir, 'pass');
