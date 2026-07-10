@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.5.0
+npm install github:andrewpopov/db-backup#v0.6.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**

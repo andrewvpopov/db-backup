@@ -3,6 +3,35 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.6.0
+
+Flat retention modes. Additive — the age-tier default is unchanged, including
+the serialized shape of `plan.policy` (no `mode` field is added to
+`DEFAULT_RETENTION_POLICY`; an absent mode means age-tier).
+
+- **Feature — `keep-last` retention**: `--keep-last <n>` (env
+  `DB_BACKUP_KEEP_LAST`) keeps the N most-recent backups and rotates out the
+  rest. Requires `n >= 1`, so a flat count can never mean "delete everything".
+- **Feature — `keep-days` retention**: `--keep-days <n>` (env
+  `DB_BACKUP_KEEP_DAYS`) keeps backups strictly younger than N days. It
+  **always retains the single most-recent backup** even when it is older than
+  the window, so a long gap between runs can never delete every backup.
+- The retention modes are mutually exclusive. Passing both `--keep-last` and
+  `--keep-days`, or combining either with `--max-backups`/`--daily-slots`, is an
+  error.
+- **Precedence**: an explicit argument always beats an env var. An env var
+  selects a flat mode only when no retention option was passed explicitly, so a
+  stale `DB_BACKUP_KEEP_LAST` cannot silently override an explicit
+  `--max-backups`.
+- The clock-skew clamp (`min(createdAt, now)`) is now shared between the
+  newest-first sort and the `keep-days` age math, so a future-dated backup reads
+  as brand new rather than negative-age in every mode.
+- **Types**: `RetentionPolicy` is now a discriminated union
+  (`AgeTierRetentionPolicy | KeepLastRetentionPolicy | KeepDaysRetentionPolicy`).
+  `DEFAULT_RETENTION_POLICY` is typed `AgeTierRetentionPolicy`, and
+  `resolveRetentionPolicy` gains overloads that narrow on a `number`
+  discriminator, so existing consumers reading `.maxBackups` still compile.
+
 ## 0.5.0
 
 Maturation pass: hardens integrity/consistency around backup and restore, and
