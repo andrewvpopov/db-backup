@@ -1870,6 +1870,66 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
+  it('restoreBackup throws when a fresh (non-stale) lock is already held, and leaves it in place', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old bytes');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored bytes');
+
+    const lockPath = path.join(outputDir, '.db-backup.lock');
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, at: fixedNow.toISOString(), token: 'someone-else' }));
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+        allowUnsafeCopy: true,
+      }),
+    ).toThrow(/holds the lock/i);
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+    // The live DB must be untouched: the lock must be checked before the restore
+    // (or the pre-restore backup) ever runs.
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('old bytes');
+  });
+
+  it('restoreBackup succeeds via an absolute --file path when outputDir does not exist, without creating outputDir or a lock file', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups'); // intentionally never created
+    const externalDir = path.join(cwd, 'external-backups');
+    fs.mkdirSync(externalDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old bytes');
+
+    const backupPath = path.join(externalDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored bytes');
+
+    expect(fs.existsSync(outputDir)).toBe(false);
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      backupFile: backupPath, // absolute path, outside outputDir
+      createPreRestoreBackup: false,
+      runtime: makeRuntime(),
+      allowUnsafeCopy: true,
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored bytes');
+    // No lock file was attempted inside a directory that doesn't exist, and the
+    // directory itself was never created as a side effect of restoring.
+    expect(fs.existsSync(outputDir)).toBe(false);
+  });
+
   // --- P1 #6: sha256 + manifest wiring ---
 
   it('runBackupJob appends a manifest entry with a 64-hex sha256', () => {
