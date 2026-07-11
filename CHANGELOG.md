@@ -3,6 +3,39 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.13.0
+
+**Fix — `restore` did not take the advisory lock, so a scheduled backup/prune
+could race a restore.** `withBackupLock` (the `.db-backup.lock` O_EXCL lock in
+`outputDir`) has guarded `runBackupJob` and `pruneBackupsJob` against each
+other since 0.5.0, but `restoreBackup` never acquired it. Nothing stopped a
+cron-driven `backup` (or a standalone `prune`) from running concurrently with
+a `restore` that is mid-way through discarding the live database's sidecars
+and renaming a new file into place — a narrow but real window for a scheduled
+job to observe or interleave with a database being replaced.
+
+This was not hypothetical: smarthome's `scripts/backup-db.sh` /
+`scripts/restore-db.sh` had to hand-roll their own separate OS-level `flock`
+specifically to cover this gap, with the lock-sharing comment spelling out
+why — "db-backup takes its own lock on the output directory, which would not
+exclude a restore, so keep this one." That is exactly the kind of workaround
+this package exists to make unnecessary.
+
+`restoreBackup` now wraps its full body (checksum verification, the
+pre-restore safety backup, and the restore itself) in the same
+`withBackupLock` used by `backup`/`prune`, so all three mutually exclude on a
+shared `outputDir`. As with `pruneBackupsJob`, a `restoreBackup` call whose
+`outputDir` does not exist on disk skips locking entirely and behaves exactly
+as before — an absolute `--file` path can legitimately live outside
+`outputDir`, and there is nothing local to protect in that case. `createBackup`
+(used internally for the pre-restore safety backup) still never acquires the
+lock itself, so there is no self-deadlock.
+
+Impact: a `restore` that previously ran unguarded now throws "Another
+db-backup run holds the lock" if it collides with a concurrent `backup` or
+`prune` on the same `outputDir`, the same failure mode those two already have
+against each other. No API or return-shape change.
+
 ## 0.12.0
 
 **Feature — an off-host dead-man's switch: remote freshness + alerts on `freshness`.**

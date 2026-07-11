@@ -1338,69 +1338,85 @@ function verifyBackupChecksum(backupEntry) {
 function restoreBackup(options = {}) {
   const resolved = resolveBackupOptions(options);
   const now = resolved.runtime.now();
-  const backupEntry = resolveRestoreBackup({
-    backupFile: options.backupFile,
-    useLatest: options.useLatest,
-    outputDir: resolved.outputDir,
-    now,
-    namePrefix: resolved.namePrefix,
-  });
-  const databaseEngine = detectDatabaseEngine(resolved.databaseUrl);
 
-  if (databaseEngine === 'unknown') {
-    throw new Error('Unsupported DATABASE_URL for restore. Expected file:, postgres://, or postgresql://');
-  }
+  const runRestore = () => {
+    const backupEntry = resolveRestoreBackup({
+      backupFile: options.backupFile,
+      useLatest: options.useLatest,
+      outputDir: resolved.outputDir,
+      now,
+      namePrefix: resolved.namePrefix,
+    });
+    const databaseEngine = detectDatabaseEngine(resolved.databaseUrl);
 
-  if (backupEntry.engine !== databaseEngine) {
-    throw new Error(
-      `Backup engine mismatch. Selected backup is "${backupEntry.engine}" but DATABASE_URL uses "${databaseEngine}".`
-    );
-  }
+    if (databaseEngine === 'unknown') {
+      throw new Error('Unsupported DATABASE_URL for restore. Expected file:, postgres://, or postgresql://');
+    }
 
-  // Before touching the live DB at all (not even the pre-restore safety
-  // backup): verify the selected backup's bytes against its manifest checksum,
-  // if one was recorded.
-  verifyBackupChecksum(backupEntry);
+    if (backupEntry.engine !== databaseEngine) {
+      throw new Error(
+        `Backup engine mismatch. Selected backup is "${backupEntry.engine}" but DATABASE_URL uses "${databaseEngine}".`
+      );
+    }
 
-  let preRestoreBackup = null;
-  if (options.createPreRestoreBackup !== false) {
-    preRestoreBackup = createBackup({
-      ...resolved,
-      databaseUrl: resolved.databaseUrl,
+    // Before touching the live DB at all (not even the pre-restore safety
+    // backup): verify the selected backup's bytes against its manifest checksum,
+    // if one was recorded.
+    verifyBackupChecksum(backupEntry);
+
+    let preRestoreBackup = null;
+    if (options.createPreRestoreBackup !== false) {
+      preRestoreBackup = createBackup({
+        ...resolved,
+        databaseUrl: resolved.databaseUrl,
+        mode: resolved.mode,
+        outputDir: resolved.outputDir,
+        compressSqlite: resolved.compressSqlite,
+        cwd: resolved.cwd,
+        runtime: resolved.runtime,
+      });
+    }
+
+    let restoreResult;
+    if (databaseEngine === 'sqlite') {
+      restoreResult = restoreSqliteBackup({
+        databaseUrl: resolved.databaseUrl,
+        backupEntry,
+        cwd: resolved.cwd,
+        runtime: resolved.runtime,
+        encryption: resolved.encryption,
+      });
+    } else {
+      restoreResult = restorePostgresBackup({
+        databaseUrl: resolved.databaseUrl,
+        backupEntry,
+        runtime: resolved.runtime,
+      });
+    }
+
+    return {
+      restored: backupEntry,
+      preRestoreBackup,
       mode: resolved.mode,
       outputDir: resolved.outputDir,
-      compressSqlite: resolved.compressSqlite,
-      cwd: resolved.cwd,
-      runtime: resolved.runtime,
-    });
-  }
-
-  let restoreResult;
-  if (databaseEngine === 'sqlite') {
-    restoreResult = restoreSqliteBackup({
-      databaseUrl: resolved.databaseUrl,
-      backupEntry,
-      cwd: resolved.cwd,
-      runtime: resolved.runtime,
-      encryption: resolved.encryption,
-    });
-  } else {
-    restoreResult = restorePostgresBackup({
-      databaseUrl: resolved.databaseUrl,
-      backupEntry,
-      runtime: resolved.runtime,
-    });
-  }
-
-  return {
-    restored: backupEntry,
-    preRestoreBackup,
-    mode: resolved.mode,
-    outputDir: resolved.outputDir,
-    engine: databaseEngine,
-    restoredAt: now.toISOString(),
-    target: restoreResult.target,
+      engine: databaseEngine,
+      restoredAt: now.toISOString(),
+      target: restoreResult.target,
+    };
   };
+
+  // Mutually exclude with runBackupJob/pruneBackupsJob on the same outputDir —
+  // a scheduled backup or prune must never run while a restore is replacing the
+  // database. As in pruneBackupsJob, don't attempt to create a lock file inside
+  // a directory that doesn't exist: a `--file`/backupFile may be an absolute
+  // path in a directory other than outputDir, and outputDir may legitimately
+  // not exist at all in that case. There is nothing local to protect there, so
+  // restore proceeds unlocked exactly as before.
+  if (!fs.existsSync(resolved.outputDir)) {
+    return runRestore();
+  }
+
+  return withBackupLock(resolved.outputDir, resolved.runtime, runRestore);
 }
 
 function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date(), namePrefix = null } = {}) {

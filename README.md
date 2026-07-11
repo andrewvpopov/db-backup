@@ -381,6 +381,10 @@ from `new Date()`.
 - PostgreSQL restore uses `pg_restore --clean --if-exists --single-transaction`.
 - PostgreSQL restore targets are redacted in return values so passwords are not
   echoed in logs.
+- `restore` takes the same advisory lock (`.db-backup.lock` in `outputDir`) as
+  `backup` and `prune`, so a scheduled backup can never run while a restore is
+  replacing the database, and vice versa. Skipped when `outputDir` doesn't
+  exist — a `--file` outside `outputDir` needs no local lock.
 
 After restore, restart the application before serving traffic.
 
