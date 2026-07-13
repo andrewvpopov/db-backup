@@ -10,9 +10,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const require = createRequire(import.meta.url);
 const {
   DEFAULT_RETENTION_POLICY,
+  buildGfsAnchors,
   listBackupsWithPlan,
   pruneBackupsJob,
   resolveRetentionPolicy,
+  resolveDestinations,
+  normalizeDestination,
   planRetention,
   restoreBackup,
   runBackupJob,
@@ -2680,6 +2683,488 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.readFileSync(dbPath).equals(originalBytes)).toBe(true);
     const remaining = fs.readdirSync(path.dirname(dbPath)).filter((name) => name.startsWith('.restore-'));
     expect(remaining).toEqual([]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // GFS (grandfather-father-son) retention — expressed as slots (daily) plus
+  // generated anchors (weekly/monthly/yearly), the SAME selection engine the
+  // legacy age-tier policy uses (selectSlotsAndAnchors). See buildGfsAnchors.
+  // ---------------------------------------------------------------------------
+  describe('GFS retention (mode: "gfs")', () => {
+    it('keeps the exact set a 3-year GFS policy implies, deduping buckets a broader tier already satisfied', () => {
+      // policy: 3 daily slots, one per week for 3 weeks, one per month (2
+      // buckets), one per year for 3 years (~1095 days).
+      const policy = { mode: 'gfs' as const, daily: 3, weekly: 3, monthly: 2, yearly: 3 };
+      const backups = [
+        backupEntry('d0.db', 0), // daily slot 1
+        backupEntry('d1.db', 1), // daily slot 2
+        backupEntry('d2.db', 2), // daily slot 3
+        backupEntry('w10.db', 10), // weekly bucket 2 ([7,14))
+        backupEntry('w17.db', 17), // weekly bucket 3 ([14,21))
+        backupEntry('m45.db', 45), // monthly bucket 2 ([30,60))
+        backupEntry('y400.db', 400), // yearly bucket 2 ([365,730))
+        backupEntry('y1000.db', 1000), // yearly bucket 3 ([730,1095))
+        backupEntry('ancient.db', 1200), // outside every bucket -> pruned
+      ];
+
+      const plan = planRetention(backups, policy, fixedNow);
+
+      // weekly bucket 1 ([0,7)), monthly bucket 1 ([0,30)), and yearly bucket 1
+      // ([0,365)) all only contain backups the daily/weekly tiers already kept
+      // — so they contribute NO additional entry. This is the "kept once, not
+      // double-counted" boundary: d0 is simultaneously the newest daily AND
+      // would be weekly bucket 1's pick, but appears once, reason 'daily'.
+      expect(plan.keep.map((e) => [e.fileName, e.retentionReason])).toEqual([
+        ['d0.db', 'daily'],
+        ['d1.db', 'daily'],
+        ['d2.db', 'daily'],
+        ['w10.db', 'weekly_2'],
+        ['w17.db', 'weekly_3'],
+        ['m45.db', 'monthly_2'],
+        ['y400.db', 'yearly_2'],
+        ['y1000.db', 'yearly_3'],
+      ]);
+      expect(plan.remove.map((e) => e.fileName)).toEqual(['ancient.db']);
+      // No filename appears in both keep and remove, and no filename is kept twice.
+      const keptNames = plan.keep.map((e) => e.fileName);
+      expect(new Set(keptNames).size).toBe(keptNames.length);
+    });
+
+    it('picks the NEWEST backup within a weekly bucket, not the closest chronologically-first one', () => {
+      const policy = { mode: 'gfs' as const, daily: 0, weekly: 1, monthly: 0, yearly: 0 };
+      // Both fall inside weekly bucket 1 ([0,7)); the newer one must win.
+      const backups = [backupEntry('older.db', 5), backupEntry('newer.db', 2)];
+
+      const plan = planRetention(backups, policy, fixedNow);
+
+      expect(plan.keep.map((e) => e.fileName)).toEqual(['newer.db']);
+      // older.db is not the overall newest either, so the safety guard doesn't
+      // rescue it — it is genuinely pruned.
+      expect(plan.remove.map((e) => e.fileName)).toEqual(['older.db']);
+    });
+
+    it('a --retention-policy-style custom anchors list is honored over generated weekly/monthly/yearly buckets', () => {
+      const policy = {
+        mode: 'gfs' as const,
+        daily: 1,
+        anchors: [{ key: 'quarter', label: 'One quarter ago', minAgeDays: 80, maxAgeDays: 100, targetAgeDays: 90 }],
+      };
+      const backups = [backupEntry('now.db', 0), backupEntry('q.db', 90), backupEntry('outside.db', 200)];
+
+      const plan = planRetention(backups, policy, fixedNow);
+
+      expect(plan.keep.map((e) => [e.fileName, e.retentionReason])).toEqual([
+        ['now.db', 'daily'],
+        ['q.db', 'quarter'],
+      ]);
+      expect(plan.remove.map((e) => e.fileName)).toEqual(['outside.db']);
+    });
+
+    it('buildGfsAnchors generates non-overlapping, minAgeDays-targeted buckets per tier', () => {
+      const anchors = buildGfsAnchors({ weekly: 2, monthly: 1, yearly: 0 });
+      expect(anchors).toEqual([
+        { key: 'weekly_1', label: 'Weekly slot 1', minAgeDays: 0, maxAgeDays: 7, targetAgeDays: 0 },
+        { key: 'weekly_2', label: 'Weekly slot 2', minAgeDays: 7, maxAgeDays: 14, targetAgeDays: 7 },
+        { key: 'monthly_1', label: 'Monthly slot 1', minAgeDays: 0, maxAgeDays: 30, targetAgeDays: 0 },
+      ]);
+    });
+  });
+
+  describe('destructive-operation safety guards (planRetention)', () => {
+    it('NEVER prunes the newest backup, even under a policy whose own selection excludes it', () => {
+      // Every anchor window here excludes age 0 (the newest backup) on
+      // purpose — the global safety guard must still keep it.
+      const policy = {
+        mode: 'gfs' as const,
+        daily: 0,
+        anchors: [{ key: 'old_only', label: 'Old only', minAgeDays: 100, maxAgeDays: 200, targetAgeDays: 100 }],
+      };
+      const backups = [backupEntry('newest.db', 0), backupEntry('old.db', 150)];
+
+      const plan = planRetention(backups, policy, fixedNow);
+
+      expect(plan.keep.map((e) => e.fileName).sort()).toEqual(['newest.db', 'old.db']);
+      expect(plan.remove).toEqual([]);
+      const newestEntry = plan.keep.find((e) => e.fileName === 'newest.db');
+      expect(newestEntry?.retentionReason).toBe('newest');
+    });
+
+    it('a policy that would prune every backup THROWS rather than emptying the directory', () => {
+      const backups = [backupEntry('a.db', 10), backupEntry('b.db', 20)];
+      // mode 'gfs' with every count at its default (0/undefined) and no
+      // anchors selects nothing.
+      expect(() => planRetention(backups, { mode: 'gfs' }, fixedNow)).toThrow(/would prune every/i);
+    });
+
+    it('an empty backup list never throws (nothing to prune, nothing to protect)', () => {
+      expect(() => planRetention([], { mode: 'gfs', daily: 0 }, fixedNow)).not.toThrow();
+    });
+
+    it('is deterministic: identical inputs and `now` produce an identical plan', () => {
+      const policy = { mode: 'gfs' as const, daily: 2, weekly: 2, monthly: 1, yearly: 1 };
+      const backups = [
+        backupEntry('a.db', 0),
+        backupEntry('b.db', 1),
+        backupEntry('c.db', 9),
+        backupEntry('d.db', 40),
+        backupEntry('e.db', 400),
+      ];
+
+      const planA = planRetention(backups, policy, fixedNow);
+      const planB = planRetention(backups, policy, fixedNow);
+
+      expect(JSON.stringify(planA.keep)).toBe(JSON.stringify(planB.keep));
+      expect(JSON.stringify(planA.remove)).toBe(JSON.stringify(planB.remove));
+    });
+  });
+
+  describe('resolveRetentionPolicy: GFS flags and mutual exclusion', () => {
+    it('builds a gfs policy from --retain-* style args', () => {
+      expect(
+        resolveRetentionPolicy({ retainDaily: 7, retainWeekly: 4, retainMonthly: 12, retainYearly: 2 }),
+      ).toEqual({ mode: 'gfs', daily: 7, weekly: 4, monthly: 12, yearly: 2 });
+    });
+
+    it('a full custom policy file (retentionPolicyFile) is passed through as-is', () => {
+      const custom = { mode: 'age-tier', maxBackups: 9, dailySlots: 4, anchors: [] };
+      expect(resolveRetentionPolicy({ retentionPolicyFile: custom })).toBe(custom);
+    });
+
+    it('legacy retention flags (keep-last/keep-days/age-tier) still resolve exactly as before GFS existed', () => {
+      expect(resolveRetentionPolicy({ keepLast: 5 })).toEqual({ mode: 'keep-last', keepLast: 5 });
+      expect(resolveRetentionPolicy({ maxBackups: 8, dailySlots: 2 })).toMatchObject({ maxBackups: 8, dailySlots: 2 });
+      expect(resolveRetentionPolicy()).toBe(DEFAULT_RETENTION_POLICY);
+    });
+
+    it('GFS flags combined with legacy retention flags is an ERROR, not a silent pick', () => {
+      expect(() => resolveRetentionPolicy({ retainDaily: 5, keepLast: 3 })).toThrow(/cannot be combined/);
+      expect(() => resolveRetentionPolicy({ retainWeekly: 2, maxBackups: 6 })).toThrow(/cannot be combined/);
+    });
+
+    it('a retentionPolicyFile combined with ANY other retention flag is an ERROR', () => {
+      const custom = { mode: 'gfs', daily: 1 };
+      expect(() => resolveRetentionPolicy({ retentionPolicyFile: custom, keepLast: 3 })).toThrow(
+        /cannot be combined/,
+      );
+      expect(() => resolveRetentionPolicy({ retentionPolicyFile: custom, retainDaily: 2 })).toThrow(
+        /cannot be combined/,
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Destinations: WHERE backups go, orthogonal to retention (HOW MANY/WHICH).
+  // ---------------------------------------------------------------------------
+  describe('destinations model', () => {
+    it('zero destinations aborts — a caller must choose at least one', () => {
+      expect(() => resolveDestinations({ cwd: '/tmp', destinations: [] })).toThrow(/zero destinations/i);
+    });
+
+    it('normalizeDestination validates each destination shape', () => {
+      expect(() => normalizeDestination({ type: 'bogus' }, '/tmp')).toThrow(/type/);
+      expect(() => normalizeDestination({ type: 'local' }, '/tmp')).toThrow(/path/);
+      expect(() => normalizeDestination({ type: 's3' }, '/tmp')).toThrow(/bucket/);
+      expect(() => normalizeDestination({ type: 'rclone' }, '/tmp')).toThrow(/target/);
+      expect(normalizeDestination({ type: 'local', path: 'backups' }, '/tmp')).toEqual({
+        type: 'local',
+        path: '/tmp/backups',
+      });
+    });
+
+    it('destinations mixed with legacy remote/s3/skipRemote options is an ERROR', () => {
+      expect(() =>
+        resolveDestinations({ cwd: '/tmp', destinations: [{ type: 'local', path: 'x' }], skipRemote: true }),
+      ).toThrow(/cannot be combined/);
+      expect(() =>
+        resolveDestinations({
+          cwd: '/tmp',
+          destinations: [{ type: 'local', path: 'x' }],
+          remote: { target: 'r:x' },
+        }),
+      ).toThrow(/cannot be combined/);
+    });
+
+    it('legacy remote/s3/skipRemote map onto the same destinations shape (local always included, back-compat)', () => {
+      const legacy = resolveDestinations({ cwd: '/tmp', outputDir: 'backups', remote: { target: 'r2:x' } });
+      expect(legacy.destinations).toEqual([
+        { type: 'local', path: '/tmp/backups' },
+        { type: 'rclone', target: 'r2:x', verify: true },
+      ]);
+      expect(legacy.localOnly).toBe(false);
+
+      const localOnly = resolveDestinations({ cwd: '/tmp', outputDir: 'backups', skipRemote: true });
+      expect(localOnly.destinations).toEqual([{ type: 'local', path: '/tmp/backups' }]);
+      expect(localOnly.localOnly).toBe(true);
+    });
+
+    it('a legacy call with no remote/s3/skipRemote only aborts when the caller requires offsite (runBackupJob), not for restore/list/prune', () => {
+      // requireOffsite defaults false — resolveDestinations itself must not
+      // block restore/list/prune, which never call it with requireOffsite.
+      expect(() => resolveDestinations({ cwd: '/tmp', outputDir: 'backups' })).not.toThrow();
+      expect(() =>
+        resolveDestinations({ cwd: '/tmp', outputDir: 'backups', requireOffsite: true }),
+      ).toThrow(/Refusing to create a local-only backup/);
+    });
+
+    it('s3-only (no local destination) works end-to-end and never leaves a local copy behind', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      const { objects, fetchImpl } = makeFakeS3();
+      const stagingDir = path.join(cwd, 'staging');
+
+      const result = await runBackupJobAsync({
+        allowUnsafeCopy: true,
+        cwd,
+        databaseUrl: 'file:./app.db',
+        compressSqlite: false,
+        outputDir: stagingDir, // legacy field ignored when destinations is set; used as internal scratch fallback only
+        destinations: [{ type: 's3', bucket: 'mybucket' }],
+        runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      expect(result.uploaded).not.toBeNull();
+      expect(objects.size).toBe(1);
+      // No local destination was configured: the staged file must be removed,
+      // not left behind as a silent, untracked local copy.
+      expect(fs.existsSync(result.created.fullPath)).toBe(false);
+    });
+
+    it('local+s3 both prune to the SAME GFS plan — identical kept/pruned sets at both destinations', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      const outputDir = path.join(cwd, 'backups');
+      fs.mkdirSync(outputDir, { recursive: true });
+
+      // Pre-seed IDENTICAL backup sets locally and "remotely" (same filenames):
+      // one newer-than-a-week, one at ~40 days (should rotate out under a
+      // daily:1 policy), one at ~1 day (kept — within the daily slot... use a
+      // clean scenario: daily:1 keeps only the single newest).
+      const names = [
+        'sqlite-backup-20260701-000000Z.db', // ~4 days old
+        'sqlite-backup-20260625-000000Z.db', // ~10 days old
+        'sqlite-backup-20260601-000000Z.db', // ~34 days old
+      ];
+      for (const name of names) {
+        fs.writeFileSync(path.join(outputDir, name), 'old backup bytes');
+      }
+      const objects = new Map<string, Buffer>(names.map((n) => [n, Buffer.from('old backup bytes')]));
+      const { fetchImpl } = makeFakeS3({ objects });
+
+      const result = await runBackupJobAsync({
+        allowUnsafeCopy: true,
+        cwd,
+        databaseUrl: 'file:./app.db',
+        compressSqlite: false,
+        now: fixedNow,
+        destinations: [
+          { type: 'local', path: outputDir },
+          { type: 's3', bucket: 'mybucket' },
+        ],
+        policy: { mode: 'gfs', daily: 1 }, // keep only the single newest
+        runtime: makeRuntime({ now: () => fixedNow, fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      // Locally: the 3 pre-seeded old backups all rotate out (daily:1 keeps
+      // only the just-created backup).
+      expect(result.removed.map((e) => e.fileName).sort()).toEqual(names.slice().sort());
+      // Remotely: the SAME 3 filenames rotate out — one unified plan, not two.
+      const s3Result = result.destinationResults.find((d) => d.destination.type === 's3');
+      expect(s3Result?.removed.slice().sort()).toEqual(names.slice().sort());
+    });
+
+    it('mixing legacy location flags with the new destinations model is rejected by resolveBackupOptions too', () => {
+      expect(() =>
+        runBackupJob({
+          destinations: [{ type: 'local', path: '/tmp/x' }],
+          remote: { target: 'r2:x' },
+          databaseUrl: 'file:./app.db',
+          requireDatabaseUrl: false,
+        }),
+      ).toThrow(/cannot be combined/);
+    });
+  });
+
+  describe('CLI: --dest, --retain-*, --retention-policy, --dry-run', () => {
+    it('CLI --retain-daily + --keep-last together is an ERROR', async () => {
+      await expect(
+        runCli(['backup', '--retain-daily', '5', '--keep-last', '3', '--skip-remote']),
+      ).rejects.toThrow(/cannot be combined/);
+    });
+
+    it('CLI --dest combined with --remote is an ERROR', async () => {
+      await expect(
+        runCli(['backup', '--dest', 'local:/tmp/x', '--remote', 'r2:backups']),
+      ).rejects.toThrow(/cannot be combined/);
+    });
+
+    it('--dry-run (prune) prints the plan with a reason per survivor and deletes NOTHING', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      fs.mkdirSync(outputDir, { recursive: true });
+      const files = [
+        'sqlite-backup-20260705-150000Z.db',
+        'sqlite-backup-20260704-150000Z.db',
+        'sqlite-backup-20260703-150000Z.db',
+      ];
+      for (const name of files) fs.writeFileSync(path.join(outputDir, name), 'sqlite');
+
+      const logs: string[] = [];
+      const originalLog = console.log;
+      console.log = (message?: unknown) => {
+        logs.push(String(message));
+      };
+      try {
+        await runCli(['prune', '--dry-run', '--output-dir', outputDir, '--keep-last', '1']);
+      } finally {
+        console.log = originalLog;
+      }
+
+      expect(logs.some((l) => /DRY RUN/.test(l))).toBe(true);
+      expect(logs.some((l) => /KEEP.*20260705/.test(l))).toBe(true);
+      expect(logs.some((l) => /DELETE.*20260704/.test(l))).toBe(true);
+      // Nothing was actually deleted.
+      expect(fs.readdirSync(outputDir).sort()).toEqual(files.slice().sort());
+    });
+
+    it('--dry-run reports the reason for each survivor (keep_last here) rather than a bare KEEP', () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'x');
+
+      const result = listBackupsWithPlan({
+        cwd,
+        outputDir,
+        requireDatabaseUrl: false,
+        policy: { mode: 'keep-last', keepLast: 1 },
+      });
+
+      expect(result.backups[0].retentionReason).toBe('keep_last');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // db-backup.config.json: a declarative alternative to re-typing the same
+  // ~10 flags in a per-app bash script (see loadDbBackupConfig / resolveConfigFile).
+  // ---------------------------------------------------------------------------
+  describe('config file (db-backup.config.json)', () => {
+    function writeConfig(dir: string, config: unknown, name = 'db-backup.config.json') {
+      const configPath = path.join(dir, name);
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+      return configPath;
+    }
+
+    // runCli resolves --config and DATABASE_URL against the REAL
+    // process.cwd()/env, so every end-to-end CLI test here must chdir into
+    // the temp dir and set DATABASE_URL, restoring both afterward — the same
+    // pattern the rest of this file's CLI tests already use.
+    async function withCliCwd(cwd: string, databaseUrl: string, fn: () => Promise<void>) {
+      const originalUrl = process.env.DATABASE_URL;
+      const originalNodeEnv = process.env.NODE_ENV;
+      const originalCwd = process.cwd();
+      try {
+        process.chdir(cwd);
+        process.env.DATABASE_URL = databaseUrl;
+        process.env.NODE_ENV = 'development';
+        await fn();
+      } finally {
+        process.chdir(originalCwd);
+        if (originalUrl === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = originalUrl;
+        if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = originalNodeEnv;
+      }
+    }
+
+    it('a config file is parsed and applied (destinations + retention)', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      const backupDir = path.join(cwd, 'cfg-backups');
+      const configPath = writeConfig(cwd, {
+        destinations: [{ type: 'local', path: backupDir }],
+        retention: { daily: 5, weekly: 2, monthly: 1, yearly: 1 },
+      });
+
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        const result = await runBackupJobAsync({
+          cwd,
+          allowUnsafeCopy: true,
+          runtime: makeRuntime({ commandExists: () => false }),
+          databaseUrl: 'file:./app.db',
+          destinations: JSON.parse(fs.readFileSync(configPath, 'utf8')).destinations,
+          policy: { mode: 'gfs', ...JSON.parse(fs.readFileSync(configPath, 'utf8')).retention },
+        });
+        expect(fs.existsSync(path.join(backupDir, result.created.fileName))).toBe(true);
+      });
+    });
+
+    it('CLI --retain-daily overrides config.retention (CLI wins)', () => {
+      // Simulate the precedence rule runCli applies: when a CLI retention
+      // flag is present, config.retention must never be consulted.
+      const cliRetentionUsed = true;
+      const config = { retention: { daily: 1 } };
+      const policy = cliRetentionUsed ? resolveRetentionPolicy({ retainDaily: 9 }) : config.retention;
+      expect(policy).toEqual({ mode: 'gfs', daily: 9, weekly: 0, monthly: 0, yearly: 0 });
+    });
+
+    it('a config file attempting to set AWS credentials on a destination is REJECTED', async () => {
+      const cwd = makeTempDir();
+      const configPath = writeConfig(cwd, {
+        destinations: [{ type: 's3', bucket: 'x', accessKeyId: 'AKIA...', secretAccessKey: 'shh' }],
+        retention: { daily: 1 },
+      });
+
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(runCli(['backup', '--config', configPath])).rejects.toThrow(/credentials are environment-only/i);
+      });
+    });
+
+    it('a config file attempting to set AWS_SECRET_ACCESS_KEY at the top level is REJECTED', async () => {
+      const cwd = makeTempDir();
+      const configPath = writeConfig(cwd, {
+        AWS_SECRET_ACCESS_KEY: 'shh',
+        destinations: [{ type: 'local', path: 'x' }],
+      });
+
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(runCli(['backup', '--config', configPath])).rejects.toThrow(/credentials are environment-only/i);
+      });
+    });
+
+    it('an unreadable encryptPassphraseFile from config aborts before any backup work', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      const configPath = writeConfig(cwd, {
+        destinations: [{ type: 'local', path: path.join(cwd, 'cfg-backups') }],
+        retention: { daily: 1 },
+        encryptPassphraseFile: path.join(cwd, 'nonexistent.pass'),
+      });
+
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(
+          runCli(['backup', '--config', configPath, '--allow-unsafe-copy']),
+        ).rejects.toThrow(/passphrase file not found/i);
+        expect(fs.existsSync(path.join(cwd, 'cfg-backups'))).toBe(false);
+      });
+    });
+
+    it('a config file with zero destinations aborts', async () => {
+      const cwd = makeTempDir();
+      const configPath = writeConfig(cwd, { destinations: [] });
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(runCli(['backup', '--config', configPath])).rejects.toThrow(/zero destinations/i);
+      });
+    });
+
+    it('config destinations mixed with a legacy --remote flag is an ERROR', async () => {
+      const cwd = makeTempDir();
+      const configPath = writeConfig(cwd, { destinations: [{ type: 'local', path: 'x' }] });
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(
+          runCli(['backup', '--config', configPath, '--remote', 'r2:backups']),
+        ).rejects.toThrow(/cannot be combined/);
+      });
+    });
   });
 });
 

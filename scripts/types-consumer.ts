@@ -10,6 +10,9 @@ import {
   listBackupsWithPlan,
   pruneBackupsJob,
   resolveRetentionPolicy,
+  resolveDestinations,
+  normalizeDestination,
+  buildGfsAnchors,
   planRetention,
   createSqliteSnapshot,
   verifySqliteBackupIntegrity,
@@ -32,6 +35,8 @@ import {
   appendBackupManifestEntry,
   type BackupEntry,
   type BackupJobResult,
+  type BackupDestinationResult,
+  type BackupDestination,
   type RestoreResult,
   type BackupListResult,
   type PruneJobResult,
@@ -39,6 +44,8 @@ import {
   type AgeTierRetentionPolicy,
   type KeepLastRetentionPolicy,
   type KeepDaysRetentionPolicy,
+  type GfsRetentionPolicy,
+  type RetentionAnchor,
   type BackupPlan,
   type BackupManifest,
   type ResolvedBackupRuntime,
@@ -79,7 +86,45 @@ const _described: string =
     ? `keep-last ${resolved.keepLast}`
     : resolved.mode === 'keep-days'
       ? `keep-days ${resolved.keepDays}`
-      : `age-tier ${resolved.maxBackups}`;
+      : resolved.mode === 'gfs'
+        ? `gfs daily=${resolved.daily ?? 0}`
+        : `age-tier ${resolved.maxBackups}`;
+
+// GFS: --retain-* style args narrow to GfsRetentionPolicy.
+const gfsPolicy: GfsRetentionPolicy = resolveRetentionPolicy({
+  retainDaily: 7,
+  retainWeekly: 4,
+  retainMonthly: 12,
+  retainYearly: 2,
+});
+const _gfsDaily: number | undefined = gfsPolicy.daily;
+planRetention([], gfsPolicy);
+
+// buildGfsAnchors is exported for a consumer that wants to inspect/compose
+// the generated weekly/monthly/yearly buckets.
+const gfsAnchors: RetentionAnchor[] = buildGfsAnchors({ weekly: 4, monthly: 12, yearly: 2 });
+const _firstAnchorKey: string = gfsAnchors[0]?.key ?? '';
+
+// Destinations: the new WHERE model, orthogonal to retention.
+const destResolution = resolveDestinations({
+  cwd: '/srv/app',
+  destinations: [
+    { type: 'local', path: '/srv/app/backups' },
+    { type: 's3', bucket: 'andrewpopov-db-backups', prefix: 'daily/app' },
+  ],
+});
+const _destList: BackupDestination[] = destResolution.destinations;
+const _destLocalOnly: boolean = destResolution.localOnly;
+const normalizedDest: BackupDestination = normalizeDestination({ type: 'local', path: 'backups' }, '/srv/app');
+if (normalizedDest.type === 'local') {
+  const _normalizedPath: string = normalizedDest.path;
+}
+
+const gfsJobResult: BackupJobResult = runBackupJob({
+  destinations: [{ type: 'local', path: '/srv/app/backups' }],
+  policy: gfsPolicy,
+});
+const _destinationResults: BackupDestinationResult[] | undefined = gfsJobResult.destinationResults;
 
 // Every policy shape is accepted by planRetention.
 planRetention([], keepLastPolicy);

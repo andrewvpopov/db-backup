@@ -29,10 +29,73 @@ export interface KeepDaysRetentionPolicy {
   keepDays: number;
 }
 
+/** Grandfather-father-son (GFS) retention: `daily` most-recent backups as
+ * literal slots (identical mechanics to `AgeTierRetentionPolicy.dailySlots`),
+ * then one backup per week/month/year bucket, generated as anchors (see
+ * `buildGfsAnchors`) unless `anchors` is supplied directly for full custom
+ * control — the same `--retention-policy` JSON-file escape hatch. This is
+ * the SAME selection engine as `AgeTierRetentionPolicy` (slots + anchors),
+ * not a parallel retention system.
+ *
+ * Applying `{ mode: 'gfs', ... }` as `BackupOptions.policy` (or via
+ * `--retain-daily`/`--retain-weekly`/`--retain-monthly`/`--retain-yearly`/
+ * `--retention-policy`) also makes every configured destination (local,
+ * rclone, S3 alike) follow this SAME plan — see `resolveDestinationPolicy`. */
+export interface GfsRetentionPolicy {
+  mode: 'gfs';
+  /** Keep the N most-recent backups as literal slots. */
+  daily?: number;
+  /** Keep one backup per week, for N weeks (generated anchor buckets). */
+  weekly?: number;
+  /** Keep one backup per month, for N months (generated anchor buckets). */
+  monthly?: number;
+  /** Keep one backup per year, for N years (generated anchor buckets). */
+  yearly?: number;
+  /** Full custom control: supplied anchors REPLACE the generated
+   * weekly/monthly/yearly buckets entirely. `daily` still applies. */
+  anchors?: RetentionAnchor[];
+}
+
 export type RetentionPolicy =
   | AgeTierRetentionPolicy
   | KeepLastRetentionPolicy
-  | KeepDaysRetentionPolicy;
+  | KeepDaysRetentionPolicy
+  | GfsRetentionPolicy;
+
+/** WHERE a backup is written/replicated to — orthogonal to `RetentionPolicy`
+ * (HOW MANY/WHICH survive). A `local` destination is not privileged: a
+ * caller may configure `destinations: [{ type: 's3', ... }]` alone for an
+ * S3-only backup. See `resolveDestinations` / `BackupOptions.destinations`. */
+export interface LocalDestination {
+  type: 'local';
+  path: string;
+}
+
+export interface RcloneDestination {
+  type: 'rclone';
+  /** rclone destination directory, e.g. `offsite:backups/app`. */
+  target: string;
+  /** Re-read the uploaded object and compare sizes. Default true. */
+  verify?: boolean;
+  /** Legacy per-destination flat count, used ONLY when no unified (GFS)
+   * policy is configured. Default 30, never fewer than 1. */
+  keep?: number;
+  /** RCLONE_CONFIG for the upload. */
+  configFile?: string;
+}
+
+export interface S3Destination {
+  type: 's3';
+  bucket: string;
+  prefix?: string;
+  endpoint?: string;
+  region?: string;
+  /** Legacy per-destination flat count, used ONLY when no unified (GFS)
+   * policy is configured. Default 30, never fewer than 1. */
+  keep?: number;
+}
+
+export type BackupDestination = LocalDestination | RcloneDestination | S3Destination;
 
 export interface BackupEncryption {
   /** Path to a file containing the symmetric passphrase. A file, never an
@@ -142,6 +205,11 @@ export interface BackupOptions {
   s3?: BackupS3Remote | null;
   /** Local-only run: skip the upload and the remote prune. */
   skipRemote?: boolean;
+  /** NEW location model: an explicit, non-empty list of where backups go.
+   * Local is not a privileged default here. Mutually exclusive with the
+   * legacy `remote`/`s3`/`skipRemote` fields — mixing them throws. An empty
+   * array throws ("you must choose where backups go"). */
+  destinations?: BackupDestination[];
   /** Filename prefix. Defaults to `sqlite-backup` / `postgres-backup`. Set this
    * to adopt an existing backup history written under another name. The engine is
    * read from the extension (`.db` / `.dump`), not the prefix.
@@ -219,18 +287,33 @@ export interface BackupPlan {
   policy: RetentionPolicy;
 }
 
+/** Per-destination upload/prune result — one entry per non-local destination
+ * in `BackupOptions.destinations` (or the legacy `remote`/`s3` mapped onto
+ * it). `uploaded`/`removedRemote` on `BackupJobResult` mirror the FIRST
+ * entry here, for back-compat with the single-remote era. */
+export interface BackupDestinationResult {
+  destination: BackupDestination;
+  uploaded: BackupUploadResult;
+  /** Filenames pruned at this destination after its verified upload. */
+  removed: string[];
+}
+
 export interface BackupJobResult {
   created: BackupEntry;
-  /** Present when `remote` was configured and not skipped. */
+  /** Back-compat: the first non-local destination's upload result (present
+   * when at least one remote/S3 destination was configured and uploaded to). */
   uploaded?: BackupUploadResult | null;
-  /** Remote objects pruned after a verified upload. */
+  /** Back-compat: the first non-local destination's pruned filenames. */
   removedRemote?: string[];
+  /** Full per-destination detail, for callers using more than one remote
+   * destination. */
+  destinationResults?: BackupDestinationResult[];
   removed: BackupEntry[];
   kept: BackupEntry[];
   mode: string;
   outputDir: string;
   policy: RetentionPolicy;
-  /** True when this run deliberately skipped offsite replication (`skipRemote`, no `remote` configured). */
+  /** True when this run deliberately skipped offsite replication (`skipRemote`, no `remote` configured, or a single `local` destination). */
   localOnly: boolean;
 }
 
@@ -298,6 +381,34 @@ export interface RestoreResult {
 
 export const DEFAULT_RETENTION_POLICY: AgeTierRetentionPolicy;
 
+/** Generate the weekly/monthly/yearly anchor buckets a GFS policy implies —
+ * see `GfsRetentionPolicy`. Exported so a consumer can inspect/compose the
+ * generated anchors (e.g. to build a custom `anchors` list that extends them). */
+export function buildGfsAnchors(policy: {
+  weekly?: number;
+  monthly?: number;
+  yearly?: number;
+}): RetentionAnchor[];
+
+/** Resolve the WHERE list — see `BackupDestination`. Pure; throws on an
+ * empty/invalid `destinations` array, on mixing `destinations` with the
+ * legacy `remote`/`s3`/`skipRemote` fields, and (only when `requireOffsite`
+ * is true — set by `runBackupJob`/`runBackupJobAsync`, never by
+ * restore/list/prune) on a legacy call with no remote/s3/skipRemote configured. */
+export function resolveDestinations(options: {
+  cwd: string;
+  outputDir?: string | null;
+  destinations?: BackupDestination[] | null;
+  remote?: BackupRemote | null;
+  s3?: BackupS3Remote | null;
+  skipRemote?: boolean;
+  requireOffsite?: boolean;
+}): { destinations: BackupDestination[]; localOnly: boolean };
+
+/** Validate and canonicalize one destination (resolving a `local` path
+ * against `cwd`). Throws on an invalid shape. */
+export function normalizeDestination(destination: unknown, cwd: string): BackupDestination;
+
 export function buildDailyCronEntry(options?: {
   hour?: number;
   minute?: number;
@@ -341,6 +452,18 @@ export function resolveRetentionPolicy(options: {
   dailySlots?: null;
   env?: NodeJS.ProcessEnv;
 }): KeepDaysRetentionPolicy;
+export function resolveRetentionPolicy(options: {
+  retainDaily?: number | string | null;
+  retainWeekly?: number | string | null;
+  retainMonthly?: number | string | null;
+  retainYearly?: number | string | null;
+  env?: NodeJS.ProcessEnv;
+}): GfsRetentionPolicy;
+/** A full custom policy file (`--retention-policy`), passed through as-is.
+ * Cannot be combined with any other retention option — mixing throws. */
+export function resolveRetentionPolicy(options: {
+  retentionPolicyFile: RetentionPolicy;
+}): RetentionPolicy;
 /** Fallback: no retention option, or one whose presence can't be known
  * statically (a string may be empty, which means "absent"). The env may then
  * select any mode, so the caller gets the union and must narrow on `mode`.
@@ -350,6 +473,11 @@ export function resolveRetentionPolicy(options?: {
   dailySlots?: number | string | null;
   keepLast?: number | string | null;
   keepDays?: number | string | null;
+  retainDaily?: number | string | null;
+  retainWeekly?: number | string | null;
+  retainMonthly?: number | string | null;
+  retainYearly?: number | string | null;
+  retentionPolicyFile?: RetentionPolicy | null;
   env?: NodeJS.ProcessEnv;
 }): RetentionPolicy;
 /** Parse a backup filename. Without `namePrefix`, only the canonical
