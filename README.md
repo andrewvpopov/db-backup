@@ -85,7 +85,10 @@ prefix set, only the canonical names are recognised — the default is not widen
 
 ## Off-host replication
 
-A backup on the same disk as the database is not a backup.
+A backup on the same disk as the database is not a backup — one disk failure
+loses both. **`backup` refuses to run unless this is a deliberate choice:** it
+aborts if neither `--remote` (offsite replication) nor `--skip-remote` (an
+explicit opt-out) is given. There is no silent local-only default.
 
 ```bash
 db-backup backup --prod \
@@ -102,8 +105,28 @@ failure, not a pass. If `rclone` is missing, the run refuses rather than silentl
 skipping the off-site copy.
 
 Remote retention never deletes the object it just uploaded (a host whose clock
-rolled backward would otherwise delete the only verified copy). Use
-`--skip-remote` for a fast local-only run, e.g. a pre-migration deploy hook.
+rolled backward would otherwise delete the only verified copy).
+
+If you genuinely want a local-only run — a pre-migration deploy hook, local
+dev, a first bootstrap run before offsite is wired up — pass `--skip-remote`
+(`skipRemote: true`) to say so explicitly:
+
+```bash
+db-backup backup --skip-remote   # local-only, on purpose
+```
+
+`BackupJobResult.localOnly` is `true` for such a run, and both the CLI and a
+`console.warn` surface a visible warning so it's never mistaken for a
+replicated backup. Omitting **both** `--remote` and `--skip-remote` is the one
+thing that's no longer allowed — that combination now throws:
+
+```
+Refusing to create a local-only backup: no --remote is configured and
+--skip-remote was not passed. A backup on the same disk as the database is
+not a backup — a single disk failure destroys both. Configure --remote
+<dest> (offsite replication via rclone), or pass --skip-remote
+(skipRemote: true) to explicitly accept the same-disk risk.
+```
 
 ### Cloudflare R2 (and other S3-compatible targets)
 

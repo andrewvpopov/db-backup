@@ -173,6 +173,8 @@ export interface BackupJobResult {
   mode: string;
   outputDir: string;
   policy: RetentionPolicy;
+  /** True when this run deliberately skipped offsite replication (`skipRemote`, no `remote` configured). */
+  localOnly: boolean;
 }
 
 export interface BackupListResult {
