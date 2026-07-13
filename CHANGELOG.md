@@ -1,5 +1,129 @@
 # Changelog
 
+## 0.17.0
+
+**Configurable grandfather-father-son (GFS) retention, applied identically to
+every destination — plus a `destinations`/`retention` split that decouples
+WHERE backups go from HOW MANY/WHICH survive, a `db-backup.config.json`
+declarative config file, and `--dry-run`.**
+
+The gap: only 6 backups total were ever kept (3 daily slots + 3 hardcoded
+age-tier anchors), a consumer had no way to say WHICH backups survive or
+WHEN they age out, and — worse — LOCAL and REMOTE retention were governed by
+two completely independent configs (`--keep-last`/age-tier locally,
+`--remote-keep` flat-count remotely), so a backup could exist on disk and
+already be gone from S3, or vice versa.
+
+- **GFS retention (`mode: 'gfs'`).** `{ daily: 7, weekly: 4, monthly: 12,
+  yearly: 2 }` keeps the 7 most-recent backups as literal daily slots, then
+  one backup per week for 4 weeks, one per month for 12 months, one per year
+  for 2 years. A backup survives if it is the newest in ANY bucket it
+  qualifies for; it is never double-counted or double-kept.
+
+  **Not a parallel retention system.** GFS is expressed in the exact same
+  "slots + anchors" vocabulary the legacy age-tier policy already used:
+  `daily` is mechanically identical to the legacy `dailySlots` (the N
+  most-recent backups, no age math), and `weekly`/`monthly`/`yearly` are
+  generated as `RetentionAnchor`s — one per bucket, with `targetAgeDays`
+  pinned to the bucket's `minAgeDays` so the existing closest-to-target
+  anchor search degenerates into "the newest backup in this bucket". Both
+  modes now share one selection function (`selectSlotsAndAnchors`); GFS just
+  feeds it a different slot count and a differently-generated anchor list
+  (`buildGfsAnchors`, also exported). For full custom control beyond what
+  weekly/monthly/yearly counts can express, a GFS policy accepts its own
+  `anchors` array directly — the same escape hatch `--retention-policy`
+  (a JSON file) uses.
+
+- **CLI:** `--retain-daily N --retain-weekly N --retain-monthly N
+  --retain-yearly N`, and `--retention-policy <file.json>` for a fully custom
+  policy object (including hand-written anchors). Programmatically, the same
+  policy object (`{ mode: 'gfs', daily, weekly, monthly, yearly }`, or any
+  custom shape) is accepted as `policy` by `runBackupJob`/`runBackupJobAsync`/
+  `planRetention`, exactly like every other policy shape always was.
+  **Combining a GFS flag with a legacy retention flag (`--keep-last`,
+  `--daily-slots`, `--keep-days`, `--max-backups`) is an ERROR**, not a
+  silent pick — `resolveRetentionPolicy` throws.
+
+- **Destinations vs. retention — two orthogonal configs, one engine.**
+  Retention coupled to LOCATION was the actual bug (`--keep-last` only ever
+  governed local; `--remote-keep` only ever governed remote — two configs
+  that could drift). This release separates them:
+  - **`destinations`** (new): an explicit, non-empty list of WHERE backups
+    go — `[{ type: 'local', path }, { type: 's3', bucket, prefix }, { type:
+    'rclone', target }]`. `local` is not a privileged default; a caller may
+    configure `s3`-only. Zero destinations aborts ("you must choose where
+    backups go" — the same fail-closed spirit as the 0.15.0 offsite guard,
+    generalized). CLI: `--dest local:/path`, `--dest s3:bucket/prefix`,
+    `--dest rclone:remote:path` (repeatable).
+  - **`policy`** (unchanged field, extended meaning): ONE retention plan.
+    Once a GFS policy is configured, the SAME `planRetention` result is
+    applied at every configured destination — local, rclone, and S3 alike —
+    via `resolveDestinationPolicy`. Local and remote can no longer drift
+    apart under a GFS policy: they are pruned by the identical plan.
+  - **Legacy flags are fully preserved, mapped onto the same engine, not a
+    second one.** `--output-dir`, `--remote`, `--s3-bucket`, `--keep-last`,
+    `--daily-slots`, `--keep-days`, `--max-backups`, `--remote-keep`,
+    `--skip-remote` behave EXACTLY as before: `resolveDestinations` maps them
+    onto the same `destinations` shape (local always included, matching
+    today's always-stage-locally-first behavior), and — absent a GFS
+    policy — each remote destination keeps its own independent flat
+    `--remote-keep` count (default 30), unchanged. `pruneRemoteBackups` and
+    `pruneS3Backups` always run through `planRetention` now (the flat count
+    becomes a synthesized `{ mode: 'keep-last', keepLast: N }` policy), so
+    there is one retention engine underneath both the legacy and new
+    behavior, never two. **Mixing `destinations`/`--dest` with the legacy
+    `remote`/`s3`/`skipRemote`/`--remote`/`--s3-bucket`/`--skip-remote`
+    options is an ERROR.**
+
+- **`db-backup.config.json`.** An app declares its whole backup setup
+  declaratively — `destinations`, `retention`, `encryptPassphraseFile`,
+  `minBytes`, `commandTimeoutSeconds`, `stampFile`, `stopWritersCmd`,
+  `startWritersCmd`, `databaseUrl` — instead of re-typing the same ~10 flags
+  in a per-app bash script. Resolution: `--config <path>` >
+  `db-backup.config.json` in the cwd > none. CLI flags always override a
+  config value; a config value always overrides the built-in default.
+  **Credentials are rejected outright if present in the file** (or on a
+  destination within it) — they remain environment-only
+  (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or the `S3_*` aliases), never
+  a flag or a config value. An `encryptPassphraseFile` that exists but isn't
+  readable now aborts BEFORE any backup work runs, regardless of whether it
+  came from the config or `--encrypt-passphrase-file` — previously this was
+  only caught after a wasted snapshot, at gpg-invocation time.
+
+- **`--dry-run` (command: `prune`).** Prints exactly what would be kept and
+  deleted — with the reason each survivor is kept ("Daily slot 1", "Weekly
+  slot 2", "Newest backup (safety guard)", ...) — and deletes nothing.
+
+- **Destructive-operation safety, now enforced inside `planRetention` itself
+  (so it applies uniformly to every caller — backup, prune, list, and every
+  destination, local or remote):**
+  - The newest backup is now NEVER pruned, whatever the policy computes —
+    even a policy whose own anchor windows exclude it is overridden by a
+    hard safety guard.
+  - A policy whose own selection keeps NOTHING (while backups exist) now
+    THROWS rather than silently emptying the backup directory. This is a
+    genuine behavior change for a badly-misconfigured legacy policy too
+    (e.g. `dailySlots: 0` with no anchors matching) — previously this
+    silently deleted every backup; it now refuses.
+  - Determinism is unchanged (still takes `now` as an injectable parameter);
+    `planRetention` is still exported and pure — bewks continues to import
+    it directly with no filesystem access.
+
+- **Worked example.** Policy `{ daily: 7, weekly: 4, monthly: 12, yearly: 2 }`
+  against a database backed up nightly for 14 months keeps: the 7 most
+  recent nightly backups; the newest backup from each of the 4 weeks before
+  that; the newest backup from each of the 12 months before that (a 30-day
+  window per bucket); nothing from `yearly` yet (the set is younger than a
+  year) — total kept count varies with cadence, but never exceeds
+  `daily + weekly + monthly + yearly` (23 here), and the newest backup always
+  survives regardless.
+
+**Back-compat:** all 125 pre-existing tests pass unchanged. `runBackupJob`/
+`runBackupJobAsync` gain a `destinationResults` field (per-destination
+upload/prune detail); `uploaded`/`removedRemote` continue to mirror the
+first non-local destination, exactly as before this release supported more
+than one remote. Runtime dependencies unchanged (`dotenv` only).
+
 ## 0.16.1
 
 Fix — the S3 remote ignored `AWS_REGION` / `AWS_DEFAULT_REGION` and defaulted to

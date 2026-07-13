@@ -58,6 +58,39 @@ const DEFAULT_RETENTION_POLICY = {
   ],
 };
 
+// Grandfather-father-son (GFS) tiers, expressed in the SAME "slots + anchors"
+// vocabulary planRetention already speaks: `daily` is a literal slot count
+// (identical mechanics to the legacy `dailySlots`), and `weekly`/`monthly`/
+// `yearly` are generated as ANCHORS — one per bucket, each with
+// targetAgeDays == minAgeDays so chooseAnchorCandidate's existing
+// closest-to-target search degenerates into "pick the newest backup in this
+// bucket". This is why GFS needs no parallel selection algorithm: it is the
+// existing age-tier engine (selectSlotsAndAnchors below) fed a different
+// slot count and a differently-generated anchor list. See selectGfs.
+const GFS_TIER_PERIOD_DAYS = { weekly: 7, monthly: 30, yearly: 365 };
+
+function buildGfsAnchors(policy) {
+  const anchors = [];
+  for (const unit of ['weekly', 'monthly', 'yearly']) {
+    const count = policy[unit] || 0;
+    const periodDays = GFS_TIER_PERIOD_DAYS[unit];
+    for (let i = 0; i < count; i += 1) {
+      const minAgeDays = i * periodDays;
+      const maxAgeDays = (i + 1) * periodDays;
+      anchors.push({
+        key: `${unit}_${i + 1}`,
+        label: `${unit.charAt(0).toUpperCase()}${unit.slice(1)} slot ${i + 1}`,
+        minAgeDays,
+        maxAgeDays,
+        // The smallest age in the bucket wins the distance search below —
+        // i.e. "the newest backup in this bucket", which is the GFS rule.
+        targetAgeDays: minAgeDays,
+      });
+    }
+  }
+  return anchors;
+}
+
 const DEFAULT_ENV_FILES = {
   base: '.env',
   dev: '.env.local',
@@ -102,6 +135,14 @@ function parseArgs(argv) {
     dailySlots: null,
     keepLast: null,
     keepDays: null,
+    retainDaily: null,
+    retainWeekly: null,
+    retainMonthly: null,
+    retainYearly: null,
+    retentionPolicyPath: null,
+    destinations: [],
+    dryRun: false,
+    configPath: null,
     commandTimeoutMs: null,
     allowUnsafeCopy: false,
     passphraseFile: null,
@@ -265,6 +306,67 @@ function parseArgs(argv) {
         throw new Error('--daily-slots must be an integer >= 0');
       }
       options.dailySlots = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--retain-daily') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--retain-daily must be an integer >= 0');
+      options.retainDaily = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--retain-weekly') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--retain-weekly must be an integer >= 0');
+      options.retainWeekly = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--retain-monthly') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--retain-monthly must be an integer >= 0');
+      options.retainMonthly = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--retain-yearly') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--retain-yearly must be an integer >= 0');
+      options.retainYearly = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--retention-policy') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --retention-policy');
+      options.retentionPolicyPath = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--dest') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --dest');
+      options.destinations.push(parseDestSpec(value));
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--dry-run') {
+      options.dryRun = true;
+      continue;
+    }
+
+    if (arg === '--config') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --config');
+      options.configPath = value;
       index += 1;
       continue;
     }
@@ -728,13 +830,26 @@ function loadEnvironment({
 }
 
 // Build a retention policy from CLI/env overrides, falling back to
-// DEFAULT_RETENTION_POLICY. Retention has two exclusive shapes: the default
-// age-tier (maxBackups/dailySlots over policy-owned anchors) and the flat modes
-// keep-last / keep-days. The mode axis is resolved first — an explicit keep-*
-// option selects a flat mode and wins over the age-tier knobs; keep-last and
-// keep-days are mutually exclusive. Precedence within a mode: explicit arg > env
-// var > default.
-function resolveRetentionPolicy({ maxBackups, dailySlots, keepLast, keepDays, env = process.env } = {}) {
+// DEFAULT_RETENTION_POLICY. Retention has THREE exclusive shapes: the default
+// age-tier (maxBackups/dailySlots over policy-owned anchors), the flat modes
+// keep-last / keep-days, and GFS (retainDaily/Weekly/Monthly/Yearly, or a
+// fully custom `retentionPolicyFile` object read from --retention-policy).
+// The mode axis is resolved first — an explicit mode-selecting option wins
+// over every other mode's knobs, and mixing two modes' options is an error
+// rather than silently picking one. Precedence within a mode: explicit arg >
+// env var > default.
+function resolveRetentionPolicy({
+  maxBackups,
+  dailySlots,
+  keepLast,
+  keepDays,
+  retainDaily,
+  retainWeekly,
+  retainMonthly,
+  retainYearly,
+  retentionPolicyFile,
+  env = process.env,
+} = {}) {
   const readInt = (value, label, min) => {
     if (value === undefined || value === null || value === '') {
       return null;
@@ -752,6 +867,37 @@ function resolveRetentionPolicy({ maxBackups, dailySlots, keepLast, keepDays, en
   const explicitKeepDays = readInt(keepDays, 'keepDays', 1);
   const explicitAgeTier =
     readInt(maxBackups, 'maxBackups', 1) !== null || readInt(dailySlots, 'dailySlots', 0) !== null;
+  const gfsCounts = [retainDaily, retainWeekly, retainMonthly, retainYearly];
+  const explicitGfs = gfsCounts.some((value) => value !== undefined && value !== null && value !== '');
+  const explicitPolicyFile = Boolean(retentionPolicyFile);
+  const anyLegacyMode = explicitKeepLast !== null || explicitKeepDays !== null || explicitAgeTier;
+
+  if (explicitPolicyFile && (anyLegacyMode || explicitGfs)) {
+    throw new Error(
+      '--retention-policy (a full custom policy file) cannot be combined with --retain-daily/' +
+        '--retain-weekly/--retain-monthly/--retain-yearly, --keep-last, --keep-days, --max-backups, ' +
+        'or --daily-slots; the file already specifies the entire policy.',
+    );
+  }
+  if (explicitPolicyFile) {
+    return retentionPolicyFile;
+  }
+
+  if (explicitGfs && anyLegacyMode) {
+    throw new Error(
+      '--retain-daily/--retain-weekly/--retain-monthly/--retain-yearly cannot be combined with ' +
+        '--keep-last, --keep-days, --max-backups, or --daily-slots; choose one retention model.',
+    );
+  }
+  if (explicitGfs) {
+    return {
+      mode: 'gfs',
+      daily: readInt(retainDaily, 'retainDaily', 0) ?? 0,
+      weekly: readInt(retainWeekly, 'retainWeekly', 0) ?? 0,
+      monthly: readInt(retainMonthly, 'retainMonthly', 0) ?? 0,
+      yearly: readInt(retainYearly, 'retainYearly', 0) ?? 0,
+    };
+  }
 
   if (explicitKeepLast !== null && explicitKeepDays !== null) {
     throw new Error('keep-last and keep-days are mutually exclusive');
@@ -802,25 +948,281 @@ function resolveRetentionPolicy({ maxBackups, dailySlots, keepLast, keepDays, en
   };
 }
 
+// ---------------------------------------------------------------------------
+// Destinations: WHERE backups go, orthogonal to retention (HOW MANY/WHICH).
+//
+// Historically this package coupled the two: `--keep-last`/age-tier governed
+// the local copy, and a completely separate flat `--remote-keep` count
+// governed the remote copy — so local and remote could drift apart (a backup
+// surviving on disk while already gone from S3, or vice versa). `destinations`
+// is an explicit list of WHERE; the single `policy` resolved by
+// resolveBackupOptions is WHICH — the same plan is applied at every
+// destination once a GFS policy is configured (see resolveDestinationPolicy /
+// runBackupJobAsync). Legacy `remote`/`s3`/`skipRemote` still work exactly as
+// before: they map onto a `destinations` list under the hood (see
+// resolveDestinations) so there is one engine, not two.
+// ---------------------------------------------------------------------------
+const DESTINATION_TYPES = ['local', 'rclone', 's3'];
+
+function normalizeDestination(dest, cwd) {
+  if (!dest || typeof dest !== 'object' || !DESTINATION_TYPES.includes(dest.type)) {
+    throw new Error(
+      `Invalid destination ${JSON.stringify(dest)}: "type" must be one of ${DESTINATION_TYPES.join(', ')}`,
+    );
+  }
+  if (dest.type === 'local') {
+    if (!dest.path) {
+      throw new Error('A "local" destination requires "path"');
+    }
+    return { type: 'local', path: path.resolve(cwd, dest.path) };
+  }
+  if (dest.type === 'rclone') {
+    const target = dest.target || dest.remote;
+    if (!target) {
+      throw new Error('A "rclone" destination requires "target" (or "remote")');
+    }
+    return {
+      type: 'rclone',
+      target,
+      ...(dest.configFile ? { configFile: dest.configFile } : {}),
+      ...(dest.keep ? { keep: dest.keep } : {}),
+      verify: dest.verify !== false,
+    };
+  }
+  // s3
+  if (!dest.bucket) {
+    throw new Error('An "s3" destination requires "bucket"');
+  }
+  return {
+    type: 's3',
+    bucket: dest.bucket,
+    ...(dest.prefix ? { prefix: dest.prefix } : {}),
+    ...(dest.endpoint ? { endpoint: dest.endpoint } : {}),
+    ...(dest.region ? { region: dest.region } : {}),
+    ...(dest.keep ? { keep: dest.keep } : {}),
+  };
+}
+
+// CLI form: --dest <type:spec>, repeatable. `type` is everything before the
+// FIRST colon (local|s3|rclone); `spec` is everything after — deliberately
+// not split further on colons, since an rclone target is itself
+// `remote:path` and contains its own colon (e.g. --dest rclone:r2:backups/app
+// -> target "r2:backups/app").
+//   local:<path>
+//   s3:<bucket>[/<prefix>]
+//   rclone:<remote-target>
+function parseDestSpec(value) {
+  const separatorIndex = value.indexOf(':');
+  if (separatorIndex === -1) {
+    throw new Error(
+      `Invalid --dest value "${value}": expected type:spec, e.g. local:/path, s3:bucket/prefix, rclone:remote:path`,
+    );
+  }
+  const type = value.slice(0, separatorIndex);
+  const spec = value.slice(separatorIndex + 1);
+  if (!spec) {
+    throw new Error(`Invalid --dest value "${value}": missing spec after "${type}:"`);
+  }
+  if (type === 'local') {
+    return { type: 'local', path: spec };
+  }
+  if (type === 's3') {
+    const slashIndex = spec.indexOf('/');
+    return slashIndex === -1
+      ? { type: 's3', bucket: spec }
+      : { type: 's3', bucket: spec.slice(0, slashIndex), prefix: spec.slice(slashIndex + 1) };
+  }
+  if (type === 'rclone') {
+    return { type: 'rclone', target: spec };
+  }
+  throw new Error(`Invalid --dest type "${type}": expected local, s3, or rclone`);
+}
+
+function loadJsonFile(filePath, label, cwd = process.cwd()) {
+  const resolvedPath = path.resolve(cwd, filePath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`${label} not found: ${resolvedPath}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Failed to parse ${label} at ${resolvedPath}: ${error.message}`);
+  }
+  return parsed;
+}
+
+const DEFAULT_CONFIG_FILENAME = 'db-backup.config.json';
+
+// Keys that look like a credential. Credentials are ENV-ONLY (see
+// resolveS3Credentials) — never accepted from a CLI flag OR a config file,
+// both of which are far more likely to be committed to a repo or logged than
+// an environment variable is.
+const CONFIG_CREDENTIAL_KEYS = [
+  'accessKeyId',
+  'secretAccessKey',
+  'awsAccessKeyId',
+  'awsSecretAccessKey',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+];
+
+function assertNoConfigCredentials(obj, where) {
+  if (!obj || typeof obj !== 'object') return;
+  for (const key of CONFIG_CREDENTIAL_KEYS) {
+    if (key in obj) {
+      throw new Error(
+        `${where} must not set "${key}": credentials are environment-only (AWS_ACCESS_KEY_ID / ` +
+          'AWS_SECRET_ACCESS_KEY, or the S3_* aliases) and are never accepted from a config file or CLI flag.',
+      );
+    }
+  }
+}
+
+// `db-backup.config.json`: an app declares its whole backup setup
+// declaratively (destinations, retention, encryption, timeouts, hooks) so a
+// deploy invocation collapses to `db-backup backup --config <file>` instead
+// of re-typing the same ~10 flags in a bash script per app. Resolution order
+// (see runCli): explicit --config <path> > db-backup.config.json in cwd >
+// none. CLI flags always override a config value; a config value always
+// overrides the built-in default (see buildCliBaseOptions).
+function loadDbBackupConfig(configPath, cwd) {
+  const config = loadJsonFile(configPath, 'Config file', cwd);
+  assertNoConfigCredentials(config, 'Config file');
+  if (Array.isArray(config.destinations)) {
+    for (const dest of config.destinations) {
+      assertNoConfigCredentials(dest, 'A destination in the config file');
+    }
+  }
+  return config;
+}
+
+function resolveConfigFile(configPath, cwd) {
+  if (configPath) {
+    return { path: path.resolve(cwd, configPath), config: loadDbBackupConfig(configPath, cwd) };
+  }
+  const defaultPath = path.resolve(cwd, DEFAULT_CONFIG_FILENAME);
+  if (fs.existsSync(defaultPath)) {
+    return { path: defaultPath, config: loadDbBackupConfig(defaultPath, cwd) };
+  }
+  return { path: null, config: null };
+}
+
+const OFFSITE_REQUIRED_MESSAGE =
+  'Refusing to create a local-only backup: no --remote/--s3-bucket/--dest is configured and ' +
+  '--skip-remote was not passed. A backup on the same disk as the database is not a backup — ' +
+  'a single disk failure destroys both. Configure --remote <dest> (rclone), --s3-bucket <bucket> ' +
+  '(native S3/R2), --dest <type:spec> (repeatable), or pass --skip-remote (skipRemote: true) to ' +
+  'explicitly accept the same-disk risk.';
+
+// Resolves the WHERE list. Two mutually exclusive shapes:
+//  - `options.destinations` (new model): an explicit, non-empty array. Local
+//    is NOT a privileged default here — a caller may choose s3-only.
+//  - legacy `outputDir`/`remote`/`s3`/`skipRemote`: mapped onto the same
+//    shape for back-compat. Local is always included (matches today's
+//    behavior of always staging the backup on disk before any upload).
+// Mixing the two throws — a caller must pick one model, not blend them.
+//
+// `requireOffsite` gates the fail-closed "you must configure somewhere
+// off-host, or explicitly opt out" guard. It defaults to false because this
+// function backs EVERY consumer of resolveBackupOptions — restore, list,
+// prune — not just a backup run; only runBackupJob/runBackupJobAsync (the
+// operations that actually create a new backup) pass `requireOffsite: true`.
+// An explicit `destinations: []` is always rejected regardless — passing an
+// empty list is never sensible for any consumer.
+function resolveDestinations({ cwd, outputDir, destinations, remote, s3, skipRemote, requireOffsite = false }) {
+  const legacyLocationUsed = Boolean(remote) || Boolean(s3) || skipRemote === true;
+
+  if (destinations) {
+    if (legacyLocationUsed) {
+      throw new Error(
+        'destinations cannot be combined with the legacy remote/s3/skipRemote options; configure only one model.',
+      );
+    }
+    if (!Array.isArray(destinations) || destinations.length === 0) {
+      throw new Error(
+        'Refusing to run with zero destinations: configure at least one place backups should go ' +
+          '(local, s3, or rclone) via destinations / --dest.',
+      );
+    }
+    const resolved = destinations.map((dest) => normalizeDestination(dest, cwd));
+    const localOnly = resolved.length === 1 && resolved[0].type === 'local';
+    return { destinations: resolved, localOnly };
+  }
+
+  if (remote && s3) {
+    throw new Error(
+      'remote (rclone) and s3 are mutually exclusive; configure only one off-host remote type.',
+    );
+  }
+
+  const legacyOutputDir = path.resolve(cwd, outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
+  const resolved = [{ type: 'local', path: legacyOutputDir }];
+  // `skipRemote` is an explicit override: even a configured remote/s3 is
+  // skipped, exactly as today (it does not merely relax the "must configure
+  // something" guard below — it actively excludes any configured remote).
+  if (remote && !skipRemote) {
+    resolved.push(normalizeDestination({ type: 'rclone', ...remote }, cwd));
+  }
+  if (s3 && !skipRemote) {
+    resolved.push(normalizeDestination({ type: 's3', ...s3 }, cwd));
+  }
+
+  if (requireOffsite && !remote && !s3 && !skipRemote) {
+    throw new Error(OFFSITE_REQUIRED_MESSAGE);
+  }
+
+  const localOnly = skipRemote === true && !remote && !s3;
+  return { destinations: resolved, localOnly };
+}
+
 function resolveBackupOptions(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
-  const outputDir = path.resolve(cwd, options.outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
   const compressSqlite = options.compressSqlite !== false;
   const allowUnsafeCopy = options.allowUnsafeCopy === true;
   const encryption = options.encryption || null;
   const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
   const stampFile = options.stampFile || null;
   const namePrefix = options.namePrefix || null;
-  const remote = options.remote || null;
-  const s3 = options.s3 || null;
-  if (remote && s3) {
-    throw new Error(
-      'remote (rclone) and s3 are mutually exclusive; configure only one off-host remote type.',
-    );
-  }
   const skipRemote = options.skipRemote === true;
-  const policy = options.policy || DEFAULT_RETENTION_POLICY;
+
+  const { destinations, localOnly } = resolveDestinations({
+    cwd,
+    outputDir: options.outputDir,
+    destinations: options.destinations || null,
+    remote: options.remote || null,
+    s3: options.s3 || null,
+    skipRemote,
+    requireOffsite: options.requireOffsite === true,
+  });
+  const outputDir = destinations.find((dest) => dest.type === 'local')?.path
+    || path.resolve(cwd, options.outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
+
+  // Encryption passphrase readability is validated HERE — before a backup is
+  // ever created — regardless of whether it came from a CLI flag or a config
+  // file. A passphrase file that exists but isn't readable (permissions,
+  // wrong host) must fail loudly up front, not surface as a confusing gpg
+  // error after the (now-wasted) snapshot work.
+  if (encryption && encryption.passphraseFile) {
+    if (!fs.existsSync(encryption.passphraseFile)) {
+      throw new Error(`Encryption passphrase file not found: ${encryption.passphraseFile}`);
+    }
+    try {
+      fs.accessSync(encryption.passphraseFile, fs.constants.R_OK);
+    } catch {
+      throw new Error(`Encryption passphrase file is not readable: ${encryption.passphraseFile}`);
+    }
+  }
+
+  const policy = options.policy || options.retention || DEFAULT_RETENTION_POLICY;
+  // Whether the SAME retention plan should drive every destination (the new
+  // GFS model) vs. each destination keeping its own legacy count (age-tier/
+  // keep-last/keep-days locally, a flat --remote-keep/dest.keep remotely —
+  // exactly today's behavior, preserved for back-compat).
+  const usingUnifiedRetention = policy.mode === 'gfs';
   const runtime = normalizeRuntime(options.runtime || options._runtime);
 
   // list/prune operate purely on the backup directory and never open the
@@ -847,10 +1249,11 @@ function resolveBackupOptions(options = {}) {
     minBytes,
     stampFile,
     namePrefix,
-    remote,
-    s3,
+    destinations,
+    localOnly,
     skipRemote,
     policy,
+    usingUnifiedRetention,
     databaseUrl,
     runtime,
   };
@@ -1830,14 +2233,22 @@ function sortByEffectiveTime(backups, now) {
   );
 }
 
-// Age-tier selection (the default policy): `dailySlots` most-recent backups,
-// then one backup per age anchor, capped at `maxBackups`.
-function selectAgeTier(sorted, policy, now) {
+// Shared by both age-tier (legacy default) and GFS: `dailyCount` most-recent
+// backups fill literal "slots" first (no age bucketing — just the N newest),
+// then `anchors` are matched in order via chooseAnchorCandidate, each
+// claiming at most one backup and excluding whatever earlier slots/anchors
+// already claimed. `maxBackups` caps the total (age-tier only; GFS passes
+// Infinity since its total is already bounded by daily+weekly+monthly+yearly).
+//
+// This is the ONE selection engine behind both modes — GFS is not a parallel
+// system, it is age-tier's mechanics fed a generated anchor list (see
+// buildGfsAnchors / selectGfs).
+function selectSlotsAndAnchors(sorted, { dailyCount = 0, anchors = [], maxBackups = Infinity, now }) {
   const selected = [];
   const selectedNames = new Set();
 
-  const dailyCount = Math.min(policy.dailySlots, policy.maxBackups);
-  sorted.slice(0, dailyCount).forEach((backup, index) => {
+  const cappedDaily = Math.min(dailyCount, maxBackups);
+  sorted.slice(0, cappedDaily).forEach((backup, index) => {
     selected.push({
       ...backup,
       retentionReason: 'daily',
@@ -1846,8 +2257,8 @@ function selectAgeTier(sorted, policy, now) {
     selectedNames.add(backup.fileName);
   });
 
-  for (const anchor of policy.anchors) {
-    if (selected.length >= policy.maxBackups) {
+  for (const anchor of anchors) {
+    if (selected.length >= maxBackups) {
       break;
     }
 
@@ -1865,6 +2276,30 @@ function selectAgeTier(sorted, policy, now) {
   }
 
   return selected;
+}
+
+// Age-tier selection (the legacy default policy): `dailySlots` most-recent
+// backups, then one backup per age anchor, capped at `maxBackups`.
+function selectAgeTier(sorted, policy, now) {
+  return selectSlotsAndAnchors(sorted, {
+    dailyCount: policy.dailySlots,
+    anchors: policy.anchors,
+    maxBackups: policy.maxBackups,
+    now,
+  });
+}
+
+// GFS selection: `daily` most-recent backups as literal slots, then one
+// backup per weekly/monthly/yearly bucket (generated anchors — see
+// buildGfsAnchors), unless the policy supplies its own `anchors` for full
+// custom control (the --retention-policy JSON file escape hatch).
+function selectGfs(sorted, policy, now) {
+  const anchors = policy.anchors || buildGfsAnchors(policy);
+  return selectSlotsAndAnchors(sorted, {
+    dailyCount: policy.daily || 0,
+    anchors,
+    now,
+  });
 }
 
 // Flat count retention: keep the N most-recent backups.
@@ -1915,8 +2350,32 @@ function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Dat
     selected = selectKeepLast(sorted, policy);
   } else if (mode === 'keep-days') {
     selected = selectKeepDays(sorted, policy, now);
+  } else if (mode === 'gfs') {
+    selected = selectGfs(sorted, policy, now);
   } else {
     selected = selectAgeTier(sorted, policy, now);
+  }
+
+  // DESTRUCTIVE-OPERATION SAFETY GUARD (1/2): a policy whose own selection
+  // keeps NOTHING, while backups exist, is a bug in the policy (e.g. every
+  // anchor's age window missed, or every count is 0) — refuse rather than
+  // silently emptying the backup directory.
+  if (sorted.length > 0 && selected.length === 0) {
+    throw new Error(
+      `Retention policy (mode "${mode}") would prune every one of ${sorted.length} backup(s); refusing. ` +
+        'Adjust the policy so at least one backup survives.',
+    );
+  }
+
+  // DESTRUCTIVE-OPERATION SAFETY GUARD (2/2): the newest backup is NEVER
+  // pruned, whatever the policy computed — even a policy that keeps other
+  // backups can, through a misconfigured anchor window, exclude the newest
+  // one specifically. Force it into the keep set rather than let that happen.
+  if (sorted.length > 0 && !selected.some((entry) => entry.fileName === sorted[0].fileName)) {
+    selected = [
+      ...selected,
+      { ...sorted[0], retentionReason: 'newest', retentionLabel: 'Newest backup (safety guard)' },
+    ];
   }
 
   const keepMap = new Map(selected.map((item) => [item.fileName, item]));
@@ -2192,12 +2651,45 @@ function uploadBackupToRemote(entry, remote, runtime) {
   return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
 }
 
-// Keep the newest `keep` remote objects, never fewer than 1, and never the object
-// we just uploaded and verified — same clock-rollback protection as the local
-// prune. A prune failure is a cleanup miss, not a data-safety issue: the new
-// backup is already verified on both ends, so warn and carry on.
-function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null) {
-  const keep = Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP);
+// Turn a bare remote/S3 filename listing into the minimal shape planRetention
+// needs ({ fileName, createdAt }) — recency comes from the filename's own
+// embedded timestamp (parseTimestampKey), the same identity the rest of the
+// package uses, never from a listing API's mtime. Filters out anything that
+// doesn't parse as one of this package's own backups (a stray file, a
+// manifest, a manually-nested layout).
+function remoteBackupEntries(names, namePrefix) {
+  return names
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .map((name) => {
+      const parsed = parseBackupFileName(name, namePrefix);
+      if (!parsed) return null;
+      const when = parseTimestampKey(parsed.timestampKey);
+      return when ? { fileName: name, createdAt: when.toISOString() } : null;
+    })
+    .filter(Boolean);
+}
+
+// Keep the newest remote objects per `policy` (same planRetention engine as
+// local retention — see resolveDestinationPolicy for how the policy is
+// chosen), never fewer than 1, and never the object we just uploaded and
+// verified. A prune failure — whether listing, planning, or an individual
+// delete — is a cleanup miss, not a data-safety issue: the new backup is
+// already verified on both ends, so warn and carry on rather than fail the
+// whole backup job.
+//
+// The just-uploaded/protected file is handled two different ways depending
+// on whether `policy` is the SAME unified plan local retention uses
+// (`usingUnifiedPolicy`):
+//  - unified (GFS): included in the planning pool (like local's
+//    finalizeBackupResult does with `created`) so slot/anchor budgets are
+//    counted accurately — matching "the same plan, everywhere" exactly — and
+//    then excluded from the resulting delete list.
+//  - legacy flat count (policy omitted): excluded from the pool BEFORE
+//    planning, exactly as today — preserved for back-compat so
+//    `--remote-keep N` still means "keep N OTHER objects", not "N total
+//    including the brand new one".
+function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
   let listing = '';
   try {
     listing = runtime
@@ -2211,24 +2703,40 @@ function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null)
     return [];
   }
 
-  const candidates = listing
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((name) => name && name !== protectFileName && parseBackupFileName(name, namePrefix))
-    .sort()
-    .reverse();
+  const usingUnifiedPolicy = Boolean(policy);
+  const rawEntries = remoteBackupEntries(listing.split(/\r?\n/), namePrefix);
+  const effectivePolicy =
+    policy || { mode: 'keep-last', keepLast: Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP) };
 
-  const doomed = candidates.slice(keep - 1);
+  let entries;
+  if (usingUnifiedPolicy) {
+    entries = rawEntries.some((entry) => entry.fileName === protectFileName)
+      ? rawEntries
+      : [...rawEntries, { fileName: protectFileName, createdAt: now.toISOString() }];
+  } else {
+    entries = rawEntries.filter((entry) => entry.fileName !== protectFileName);
+  }
+
+  let plan;
+  try {
+    plan = planRetention(entries, effectivePolicy, now);
+  } catch (error) {
+    console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
+    return [];
+  }
+
+  const doomed = usingUnifiedPolicy ? plan.remove.filter((entry) => entry.fileName !== protectFileName) : plan.remove;
+
   const deleted = [];
-  for (const name of doomed) {
+  for (const entry of doomed) {
     try {
-      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, name)], {
+      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, entry.fileName)], {
         stdio: 'pipe',
         env: rcloneEnv(remote),
       });
-      deleted.push(name);
+      deleted.push(entry.fileName);
     } catch (error) {
-      console.warn(`[db-backup] Failed to prune remote backup ${name} (leaving it in place): ${error.message}`);
+      console.warn(`[db-backup] Failed to prune remote backup ${entry.fileName} (leaving it in place): ${error.message}`);
     }
   }
   return deleted;
@@ -2376,62 +2884,75 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   }
 }
 
-// Fail closed on a silent same-disk-only "backup". A backup that lives only
-// on the disk that holds the database is not a backup — one disk failure
-// loses both copies. This must be a DELIBERATE choice, so the caller has to
-// either configure offsite replication or explicitly opt in to the risk.
-// No file is created and nothing is left implying success. See rouge's
-// deploy/backup-rouge-db.sh (ROG-1138): a hand-rolled wrapper already learned
-// this the hard way — "no offsite" produced nine silent nights of local-only
-// backups before anyone noticed.
-// A remote is configured whether it's the rclone target OR the native S3
-// (AWS/R2) config — either satisfies the "not local-only" requirement. Shared
-// by runBackupJob and runBackupJobAsync so the guard can't drift between them.
-function assertOffsiteRemoteConfigured(resolved) {
-  const hasRemote = Boolean(resolved.remote) || Boolean(resolved.s3);
-  const localOnly = resolved.skipRemote === true && !hasRemote;
-  if (!hasRemote && !resolved.skipRemote) {
-    throw new Error(
-      'Refusing to create a local-only backup: no --remote/--s3-bucket is configured and ' +
-      '--skip-remote was not passed. A backup on the same disk as the database is not a ' +
-      'backup — a single disk failure destroys both. Configure --remote <dest> (offsite ' +
-      'replication via rclone) or --s3-bucket <bucket> (native AWS S3 / Cloudflare R2), or ' +
-      'pass --skip-remote (skipRemote: true) to explicitly accept the same-disk risk.',
-    );
+// The retention policy applied AT a given destination. Local always uses
+// `resolved.policy` directly. A remote (rclone/s3) destination follows the
+// SAME unified plan too, once a GFS policy is configured (usingUnifiedRetention)
+// — that is the whole point of the destinations+retention split: one plan,
+// every destination. Absent that, a remote destination keeps its legacy,
+// independent flat count (dest.keep, defaulting per-type) exactly as before,
+// so an existing `--remote-keep`-only deployment behaves unchanged.
+function resolveDestinationPolicy(destination, resolved) {
+  if (destination.type === 'local') {
+    return resolved.policy;
   }
-  return { hasRemote, localOnly };
+  if (resolved.usingUnifiedRetention) {
+    return resolved.policy;
+  }
+  const defaultKeep = destination.type === 's3' ? DEFAULT_S3_KEEP : DEFAULT_REMOTE_KEEP;
+  const keep = Math.max(1, Number(destination.keep) > 0 ? Number(destination.keep) : defaultKeep);
+  return { mode: 'keep-last', keepLast: keep };
 }
 
-// Shared bottom half of a backup run, once the (already-uploaded-and-verified,
-// or intentionally skipped) remote copy is known: local retention, manifest,
-// and the success stamp. Entirely synchronous — no network I/O here — so both
-// runBackupJob and runBackupJobAsync call it the same way.
-function finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly) {
-  const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
-  const plan = planRetention(backups, resolved.policy, now);
+// Shared bottom half of a backup run, once every destination's upload (if
+// any) is known-uploaded-and-verified: local retention, per-destination
+// remote retention, manifest, and the success stamp. `distributions` is a
+// per-non-local-destination `{ destination, uploaded, removed }` list.
+// Entirely synchronous — no network I/O here — so both the sync and async
+// distribute paths below call it identically.
+function finalizeBackupResult(resolved, created, now, distributions) {
+  const localDestination = resolved.destinations.find((dest) => dest.type === 'local');
+  let removed = [];
+  let kept = [];
 
-  // NEVER prune the backup we just created and verified, whatever the plan
-  // says. A host whose clock jumped backward at boot gives the new file an
-  // older timestamp than existing ones, and a retention policy that trusts the
-  // ordering would then delete the only known-good backup.
-  const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
-  const removed = pruneBackups(doomed);
+  if (localDestination) {
+    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
+    const plan = planRetention(backups, resolved.policy, now);
+
+    // NEVER prune the backup we just created and verified, whatever the plan
+    // says. A host whose clock jumped backward at boot gives the new file an
+    // older timestamp than existing ones, and a retention policy that trusts
+    // the ordering would then delete the only known-good backup.
+    const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
+    removed = pruneBackups(doomed);
+    kept = plan.keep;
+  } else {
+    // Local was not a chosen destination: the staged file was only ever
+    // scratch space for the upload(s) above. It must not linger as a silent,
+    // untracked local copy once every configured destination has confirmed
+    // it — remove it now that finalize is running only after every upload
+    // above succeeded and verified.
+    fs.rmSync(created.fullPath, { force: true });
+  }
 
   // Best-effort: a manifest write failure must never fail the backup itself.
   // Safety/pre-restore backups (created via createBackup outside this job)
-  // are intentionally NOT manifested — they're transient.
-  try {
-    appendBackupManifestEntry(resolved.outputDir, {
-      name: created.fileName,
-      path: created.fullPath,
-      createdAt: created.createdAt,
-      sizeBytes: created.sizeBytes,
-      engine: created.engine,
-      compressed: created.compressed,
-      sha256: created.sha256,
-    });
-  } catch (error) {
-    console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+  // are intentionally NOT manifested — they're transient. Only written when
+  // local is a destination — a manifest with no corresponding local file is
+  // misleading, and checksums are re-verifiable from the destination anyway.
+  if (localDestination) {
+    try {
+      appendBackupManifestEntry(resolved.outputDir, {
+        name: created.fileName,
+        path: created.fullPath,
+        createdAt: created.createdAt,
+        sizeBytes: created.sizeBytes,
+        engine: created.engine,
+        compressed: created.compressed,
+        sha256: created.sha256,
+      });
+    } catch (error) {
+      console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+    }
   }
 
   // Stamped only after the backup exists, passed its integrity check, cleared
@@ -2442,116 +2963,163 @@ function finalizeBackupResult(resolved, created, now, uploaded, removedRemote, l
     writeSuccessStamp(resolved.stampFile, now);
   }
 
+  const remoteDistributions = distributions.filter((d) => d.destination.type !== 'local');
   return {
     created,
     removed,
-    removedRemote,
-    uploaded,
-    kept: plan.keep,
+    // Back-compat singular fields: the (only) remote's upload/prune result,
+    // exactly as before this package supported more than one remote.
+    uploaded: remoteDistributions[0] ? remoteDistributions[0].uploaded : null,
+    removedRemote: remoteDistributions[0] ? remoteDistributions[0].removed : [],
+    // Full per-destination detail, for callers using more than one remote.
+    destinationResults: distributions,
+    kept,
     mode: resolved.mode,
     outputDir: resolved.outputDir,
     policy: resolved.policy,
-    localOnly,
+    localOnly: resolved.localOnly,
   };
 }
 
 const S3_SYNC_REFUSAL_MESSAGE =
-  'runBackupJob (the synchronous API) cannot use an S3 remote: uploading it would block the ' +
+  'runBackupJob (the synchronous API) cannot use an S3 destination: uploading it would block the ' +
   'Node event loop for the entire upload, which is fine for a one-shot CLI process but freezes ' +
   'an in-process/library host (e.g. every request an app server is handling) for as long as the ' +
   'upload takes. Use runBackupJobAsync(options) (await it — its S3 upload runs on the normal ' +
   'async `fetch`, not the event loop) or the `db-backup` CLI, which already awaits it. ' +
-  'runBackupJob remains fully supported for --remote (rclone) and local-only (skipRemote) backups.';
+  'runBackupJob remains fully supported for rclone and local-only backups.';
 
-// Synchronous backup job. Supports the rclone remote and local-only
-// (skipRemote) backups exactly as before. Deliberately REFUSES an S3 remote —
-// see S3_SYNC_REFUSAL_MESSAGE — rather than silently blocking the event loop
-// or silently falling back to some other behavior. Use runBackupJobAsync for
-// S3.
+function warnIfLocalOnly(resolved, remoteDestinations) {
+  if (remoteDestinations.length === 0 && resolved.localOnly) {
+    console.warn(
+      '[db-backup] WARNING: local-only backup (no remote/off-host destination configured). ' +
+      'This backup exists only on the same disk as the database.',
+    );
+  }
+}
+
+// Synchronous backup job. Supports rclone and local-only destinations
+// exactly as before. Deliberately REFUSES an S3 destination — see
+// S3_SYNC_REFUSAL_MESSAGE — rather than silently blocking the event loop or
+// silently falling back to some other behavior. Use runBackupJobAsync for S3.
+//
+// Fully synchronous top to bottom (no async/await, no Promise) — this is
+// what lets it stay a plain, non-async function that any sync caller can use
+// without ever touching a Promise. runBackupJobAsync is the async twin that
+// additionally supports S3; the two share resolveBackupOptions,
+// resolveDestinationPolicy, and finalizeBackupResult, and differ only in how
+// they upload/prune each destination (sync execFileSync vs. async fetch).
 function runBackupJob(options = {}) {
-  const resolved = resolveBackupOptions(options);
+  const resolved = resolveBackupOptions({ ...options, requireOffsite: true });
 
-  if (resolved.s3) {
+  const remoteDestinations = resolved.destinations.filter((dest) => dest.type !== 'local');
+  if (remoteDestinations.some((dest) => dest.type === 's3')) {
     throw new Error(S3_SYNC_REFUSAL_MESSAGE);
   }
-
-  const { localOnly } = assertOffsiteRemoteConfigured(resolved);
 
   ensureBackupDir(resolved.outputDir);
 
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
-    const created = createBackup(resolved);
+    // createBackup re-derives via resolveBackupOptions; `destinations` is
+    // already fully resolved here, so pass skipRemote:false to avoid it
+    // reading as a second, conflicting location model on re-entry.
+    const created = createBackup({ ...resolved, skipRemote: false });
     const now = resolved.runtime.now();
 
+    warnIfLocalOnly(resolved, remoteDestinations);
+
     // Replicate off-host BEFORE anything is pruned or stamped. A local-only
-    // backup dies with the disk it sits on; an unverified remote copy is not a
-    // backup. If the upload or its verification fails we throw here, so the
-    // previous good backups and the previous stamp both survive untouched.
-    let uploaded = null;
-    if (resolved.remote && !resolved.skipRemote) {
-      uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
-    } else if (localOnly) {
-      console.warn(
-        '[db-backup] WARNING: local-only backup (skipRemote explicitly set, no remote ' +
-        'configured). This backup exists only on the same disk as the database.',
+    // backup dies with the disk it sits on; an unverified remote copy is not
+    // a backup. If any upload or its verification fails we throw here, so
+    // the previous good backups and the previous stamp both survive
+    // untouched at every destination, local included.
+    const distributions = remoteDestinations.map((destination) => ({
+      destination,
+      uploaded: uploadBackupToRemote(created, destination, resolved.runtime),
+      removed: [],
+    }));
+
+    // Retention is applied per destination only after EVERY destination has
+    // a verified copy — a prune must never run ahead of replication. The
+    // SAME policy drives every destination once a GFS policy is configured
+    // (resolveDestinationPolicy); otherwise each keeps its legacy count.
+    for (const distribution of distributions) {
+      const policy = resolveDestinationPolicy(distribution.destination, resolved);
+      distribution.removed = pruneRemoteBackups(
+        distribution.destination,
+        created.fileName,
+        resolved.runtime,
+        resolved.namePrefix,
+        policy,
+        now,
       );
     }
 
-    // Remote retention is best-effort: the new object is verified on both ends,
-    // so a stray old copy is a cleanup miss, not a data-safety issue.
-    const removedRemote =
-      uploaded && resolved.remote
-        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime, resolved.namePrefix)
-        : [];
-
-    return finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly);
+    return finalizeBackupResult(resolved, created, now, distributions);
   });
 }
 
 // Async backup job — the correct entry point for any in-process/library
-// caller whose S3 remote must not block its event loop (e.g. a Next.js API
-// route). Supports everything runBackupJob supports (rclone, local-only)
-// PLUS a native S3/R2 remote, uploaded via the real async `fetch` (see
+// caller whose S3 destination must not block its event loop (e.g. a Next.js
+// API route). Supports everything runBackupJob supports (rclone, local-only)
+// PLUS a native S3/R2 destination, uploaded via the real async `fetch` (see
 // s3-remote.js) with no worker thread and no Atomics.wait anywhere in the
 // call chain. The CLI awaits this for every `backup` invocation.
 async function runBackupJobAsync(options = {}) {
-  const resolved = resolveBackupOptions(options);
-
-  const { localOnly } = assertOffsiteRemoteConfigured(resolved);
+  const resolved = resolveBackupOptions({ ...options, requireOffsite: true });
 
   ensureBackupDir(resolved.outputDir);
 
   return withBackupLockAsync(resolved.outputDir, resolved.runtime, async () => {
-    const created = createBackup(resolved);
+    // createBackup re-derives via resolveBackupOptions; `destinations` is
+    // already fully resolved here, so pass skipRemote:false to avoid it
+    // reading as a second, conflicting location model on re-entry.
+    const created = createBackup({ ...resolved, skipRemote: false });
     const now = resolved.runtime.now();
 
-    // Replicate off-host BEFORE anything is pruned or stamped. A local-only
-    // backup dies with the disk it sits on; an unverified remote copy is not a
-    // backup. If the upload or its verification fails we throw (reject) here,
-    // so the previous good backups and the previous stamp both survive
-    // untouched.
-    let uploaded = null;
-    if (resolved.remote && !resolved.skipRemote) {
-      uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
-    } else if (resolved.s3 && !resolved.skipRemote) {
-      uploaded = await uploadBackupToS3(created, resolved.s3, resolved.runtime);
-    } else if (localOnly) {
-      console.warn(
-        '[db-backup] WARNING: local-only backup (skipRemote explicitly set, no remote ' +
-        'configured). This backup exists only on the same disk as the database.',
-      );
+    const remoteDestinations = resolved.destinations.filter((dest) => dest.type !== 'local');
+    warnIfLocalOnly(resolved, remoteDestinations);
+
+    // Replicate off-host BEFORE anything is pruned or stamped — see
+    // runBackupJob for the full rationale. Uploads run in order (not
+    // parallel) so a failure on destination N leaves destinations after it
+    // untouched, and the ones before it already verified.
+    const distributions = [];
+    for (const destination of remoteDestinations) {
+      const uploaded =
+        destination.type === 's3'
+          ? await uploadBackupToS3(created, destination, resolved.runtime)
+          : uploadBackupToRemote(created, destination, resolved.runtime);
+      distributions.push({ destination, uploaded, removed: [] });
     }
 
-    // Remote retention is best-effort: the new object is verified on both ends,
-    // so a stray old copy is a cleanup miss, not a data-safety issue.
-    const removedRemote =
-      uploaded && resolved.remote
-        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime, resolved.namePrefix)
-        : uploaded && resolved.s3
-          ? await pruneS3Backups(resolved.s3, created.fileName, resolved.runtime, resolved.namePrefix, parseBackupFileName)
-          : [];
+    // Retention is applied per destination only after EVERY destination has
+    // a verified copy — a prune must never run ahead of replication.
+    for (const distribution of distributions) {
+      const policy = resolveDestinationPolicy(distribution.destination, resolved);
+      distribution.removed =
+        distribution.destination.type === 's3'
+          ? await pruneS3Backups(
+              distribution.destination,
+              created.fileName,
+              resolved.runtime,
+              resolved.namePrefix,
+              parseBackupFileName,
+              planRetention,
+              policy,
+              now,
+            )
+          : pruneRemoteBackups(
+              distribution.destination,
+              created.fileName,
+              resolved.runtime,
+              resolved.namePrefix,
+              policy,
+              now,
+            );
+    }
 
-    return finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly);
+    return finalizeBackupResult(resolved, created, now, distributions);
   });
 }
 
@@ -2603,11 +3171,28 @@ Commands:
 Options:
   --prod                  Use production env files (.env + .env.production)
   --dev                   Use development env files (.env + .env.local)
-  --output-dir <path>     Backup directory (default: backups/database)
-  --max-backups <n>       Age-tier: max backups to retain (env: DB_BACKUP_MAX_BACKUPS)
-  --daily-slots <n>       Age-tier: recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
-  --keep-last <n>         Flat retention: keep the N most-recent backups (env: DB_BACKUP_KEEP_LAST)
-  --keep-days <n>         Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
+  --config <path>         Load db-backup.config.json (declarative destinations +
+                          retention). Default: db-backup.config.json in cwd, if present.
+                          CLI flags always override the config; the config overrides
+                          built-in defaults. Never put credentials in this file.
+  --dest <type:spec>      Destination, repeatable: local:<path>, s3:<bucket>[/<prefix>],
+                          rclone:<remote:path>. The NEW location model — an explicit,
+                          non-empty list of where backups go. Cannot be combined with the
+                          legacy --remote/--s3-bucket/--skip-remote/--output-dir flags.
+  --output-dir <path>     [legacy] Backup directory (default: backups/database)
+  --retain-daily <n>      GFS: keep the N most-recent backups
+  --retain-weekly <n>     GFS: keep one backup per week, for N weeks
+  --retain-monthly <n>    GFS: keep one backup per month, for N months
+  --retain-yearly <n>     GFS: keep one backup per year, for N years
+                          --retain-* apply the SAME plan to every destination (local
+                          and remote alike). Cannot mix with --max-backups/--daily-slots/
+                          --keep-last/--keep-days (legacy, local-only retention).
+  --retention-policy <file.json>  Full custom policy (anchors, GFS, or legacy shape) —
+                          the escape hatch for anything --retain-* can't express.
+  --max-backups <n>       [legacy] Age-tier: max backups to retain (env: DB_BACKUP_MAX_BACKUPS)
+  --daily-slots <n>       [legacy] Age-tier: recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
+  --keep-last <n>         [legacy] Flat retention: keep the N most-recent backups (env: DB_BACKUP_KEEP_LAST)
+  --keep-days <n>         [legacy] Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
   --command-timeout <s>   Bound every external command (env: DB_BACKUP_COMMAND_TIMEOUT_MS)
   --allow-unsafe-copy     Permit a byte copy when sqlite3 is absent (inconsistent)
   --encrypt-passphrase-file <path>  Encrypt the backup (gpg symmetric AES256)
@@ -2616,19 +3201,23 @@ Options:
   --name-prefix <name>    Filename prefix (default sqlite-backup / postgres-backup)
   --stamp-file <path>     Write .last-success only after a fully successful run
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
-  --remote <dest>         Upload off-host via rclone and verify (e.g. remote:path)
-  --remote-keep <n>       Remote backups to retain (default 30; applies to --remote or --s3-bucket)
+  --remote <dest>         [legacy] Upload off-host via rclone and verify (e.g. remote:path)
+  --remote-keep <n>       [legacy] Remote backups to retain (default 30) when no GFS
+                          policy is configured; ignored (the unified plan wins) once
+                          --retain-*/--retention-policy/config.retention is set.
   --rclone-config <path>  RCLONE_CONFIG for the upload (and remote freshness check)
-  --s3-bucket <name>      Upload off-host to S3/R2 natively (SigV4, no rclone) and verify.
-                          Mutually exclusive with --remote. Credentials come from the
-                          environment ONLY: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or
-                          S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY) — never a flag.
+  --s3-bucket <name>      [legacy] Upload off-host to S3/R2 natively (SigV4, no rclone) and
+                          verify. Mutually exclusive with --remote. Credentials come from
+                          the environment ONLY: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or
+                          S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY) — never a flag or config file.
   --s3-prefix <path>      Key prefix under the bucket (default: none)
   --s3-endpoint <url>     S3-compatible endpoint, e.g. Cloudflare R2:
                           https://<account>.r2.cloudflarestorage.com (default: AWS S3)
   --s3-region <region>    Signing region (default: auto for R2/--s3-endpoint, us-east-1 for AWS)
   --s3-timeout <s>        Bound every S3 HTTP request (env: DB_BACKUP_S3_TIMEOUT_MS, default 300)
-  --skip-remote           Local-only run: no upload, no remote prune
+  --skip-remote           [legacy] Local-only run: no upload, no remote prune
+  --dry-run               (command: prune) Print the keep/delete plan with a reason per
+                          survivor; delete nothing.
   --notify-discord <url>  freshness: POST an alert to a Discord webhook on failure
   --notify-webhook <url>  freshness: POST {"text":...} to a webhook on failure
   --notify-command <cmd>  freshness: run cmd on failure ($DB_BACKUP_ALERT = message)
@@ -2766,41 +3355,126 @@ async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
+  // Config file: an app declares its whole setup once instead of re-typing
+  // flags in a bash script per app. Resolution: --config <path> >
+  // db-backup.config.json in cwd > none. Every value below is CLI-flag- >
+  // config- > built-in-default, so a config never silently overrides an
+  // explicit flag.
+  const { config } = resolveConfigFile(options.configPath, process.cwd());
+
+  // Location model: CLI --dest > config.destinations > legacy flags. Mixing
+  // --dest (or a config destinations list) with a legacy location flag
+  // (--remote/--s3-bucket/--skip-remote/--output-dir) is an error — resolved
+  // here, once, rather than left to resolveDestinations to reject deep
+  // inside resolveBackupOptions where the message would lack CLI context.
+  const cliDestinations = options.destinations.length > 0 ? options.destinations : null;
+  const configDestinations = !cliDestinations && config && config.destinations ? config.destinations : null;
+  const newModelDestinations = cliDestinations || configDestinations;
+  const legacyLocationFlagsUsed =
+    Boolean(options.remoteTarget) || Boolean(options.s3Bucket) || options.skipRemote === true;
+  if (newModelDestinations && legacyLocationFlagsUsed) {
+    throw new Error(
+      '--dest (or a config file destinations list) cannot be combined with the legacy --remote/' +
+        '--s3-bucket/--skip-remote flags; configure only one location model.',
+    );
+  }
+
+  // Retention model: CLI --retain-*/--retention-policy > config.retention >
+  // legacy flags/env/default. A config `retention` object is either a GFS
+  // shape ({daily,weekly,monthly,yearly}) or a fully custom policy object
+  // (has its own `mode`) — either is passed straight through, mirroring the
+  // --retention-policy JSON file escape hatch.
+  const retentionPolicyFile = options.retentionPolicyPath
+    ? loadJsonFile(options.retentionPolicyPath, '--retention-policy file')
+    : null;
+  const cliRetentionUsed =
+    retentionPolicyFile ||
+    [options.retainDaily, options.retainWeekly, options.retainMonthly, options.retainYearly].some(
+      (v) => v !== null,
+    );
+  const legacyRetentionFlagsUsed =
+    options.maxBackups !== null || options.dailySlots !== null || options.keepLast !== null || options.keepDays !== null;
+  let policy;
+  if (cliRetentionUsed) {
+    if (legacyRetentionFlagsUsed) {
+      throw new Error(
+        '--retain-daily/--retain-weekly/--retain-monthly/--retain-yearly/--retention-policy cannot be ' +
+          'combined with --keep-last/--keep-days/--max-backups/--daily-slots; choose one retention model.',
+      );
+    }
+    policy = resolveRetentionPolicy({
+      retainDaily: options.retainDaily,
+      retainWeekly: options.retainWeekly,
+      retainMonthly: options.retainMonthly,
+      retainYearly: options.retainYearly,
+      retentionPolicyFile,
+    });
+  } else if (config && config.retention && !legacyRetentionFlagsUsed) {
+    policy = config.retention.mode
+      ? config.retention
+      : {
+          mode: 'gfs',
+          daily: config.retention.daily || 0,
+          weekly: config.retention.weekly || 0,
+          monthly: config.retention.monthly || 0,
+          yearly: config.retention.yearly || 0,
+        };
+  } else {
+    policy = resolveRetentionPolicy({
+      maxBackups: options.maxBackups,
+      dailySlots: options.dailySlots,
+      keepLast: options.keepLast,
+      keepDays: options.keepDays,
+    });
+  }
+
+  const passphraseFile = options.passphraseFile || (config && config.encryptPassphraseFile) || null;
+  const cipher = options.cipher || (config && config.cipher) || null;
+  const minBytes = options.minBytes !== null ? options.minBytes : (config && config.minBytes) || null;
+  const stampFile = options.stampFile || (config && config.stampFile) || null;
+  const commandTimeoutMs =
+    options.commandTimeoutMs !== null
+      ? options.commandTimeoutMs
+      : config && config.commandTimeoutSeconds
+        ? config.commandTimeoutSeconds * 1000
+        : null;
+  const stopWritersCommand = options.stopWritersCommand || (config && config.stopWritersCmd) || null;
+  const startWritersCommand = options.startWritersCommand || (config && config.startWritersCmd) || null;
+  const configDatabaseUrl = !process.env.DATABASE_URL && config && config.databaseUrl ? config.databaseUrl : null;
+
   const baseOptions = {
     mode: options.mode,
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
     allowUnsafeCopy: options.allowUnsafeCopy,
-    encryption: options.passphraseFile
-      ? { passphraseFile: options.passphraseFile, ...(options.cipher ? { cipher: options.cipher } : {}) }
-      : null,
-    minBytes: options.minBytes,
-    stampFile: options.stampFile,
+    ...(configDatabaseUrl ? { databaseUrl: configDatabaseUrl } : {}),
+    encryption: passphraseFile ? { passphraseFile, ...(cipher ? { cipher } : {}) } : null,
+    minBytes,
+    stampFile,
     namePrefix: options.namePrefix,
-    remote: options.remoteTarget
-      ? {
-          target: options.remoteTarget,
-          ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
-          ...(options.rcloneConfig ? { configFile: options.rcloneConfig } : {}),
-        }
-      : null,
-    s3: options.s3Bucket
-      ? {
-          bucket: options.s3Bucket,
-          ...(options.s3Prefix ? { prefix: options.s3Prefix } : {}),
-          ...(options.s3Endpoint ? { endpoint: options.s3Endpoint } : {}),
-          ...(options.s3Region ? { region: options.s3Region } : {}),
-          ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
-        }
-      : null,
-    skipRemote: options.skipRemote,
-    runtime: { commandTimeoutMs: options.commandTimeoutMs, s3TimeoutMs: options.s3TimeoutMs },
-    policy: resolveRetentionPolicy({
-      maxBackups: options.maxBackups,
-      dailySlots: options.dailySlots,
-      keepLast: options.keepLast,
-      keepDays: options.keepDays,
-    }),
+    ...(newModelDestinations
+      ? { destinations: newModelDestinations }
+      : {
+          remote: options.remoteTarget
+            ? {
+                target: options.remoteTarget,
+                ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
+                ...(options.rcloneConfig ? { configFile: options.rcloneConfig } : {}),
+              }
+            : null,
+          s3: options.s3Bucket
+            ? {
+                bucket: options.s3Bucket,
+                ...(options.s3Prefix ? { prefix: options.s3Prefix } : {}),
+                ...(options.s3Endpoint ? { endpoint: options.s3Endpoint } : {}),
+                ...(options.s3Region ? { region: options.s3Region } : {}),
+                ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
+              }
+            : null,
+          skipRemote: options.skipRemote,
+        }),
+    runtime: { commandTimeoutMs, s3TimeoutMs: options.s3TimeoutMs },
+    policy,
   };
 
   if (options.command === 'list') {
@@ -2822,6 +3496,30 @@ async function runCli(argv = process.argv.slice(2)) {
   }
 
   if (options.command === 'prune') {
+    // --dry-run: compute and print the exact same plan prune would apply,
+    // with a reason per survivor, and delete NOTHING. This is the sanity
+    // check an operator runs before trusting a policy — see listBackupsWithPlan,
+    // which is pure (never touches the filesystem beyond reading it).
+    if (options.dryRun) {
+      const result = listBackupsWithPlan(baseOptions);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`[db-backup] DRY RUN — nothing will be deleted.`);
+      console.log(`[db-backup] Mode: ${result.mode}`);
+      console.log(`[db-backup] Output directory: ${result.outputDir}`);
+      result.backups.forEach((backup) => {
+        const marker = backup.keep ? 'KEEP   ' : 'DELETE ';
+        console.log(`  ${marker}| ${backup.fileName} | ${backup.retentionLabel} | ${formatBytes(backup.sizeBytes)}`);
+      });
+      const toDelete = result.backups.filter((backup) => !backup.keep).length;
+      console.log(
+        `[db-backup] Would keep ${result.backups.length - toDelete} backup(s), would remove ${toDelete} backup(s).`,
+      );
+      return;
+    }
+
     const result = pruneBackupsJob(baseOptions);
     if (options.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -2845,8 +3543,8 @@ async function runCli(argv = process.argv.slice(2)) {
       backupFile: options.backupFile,
       useLatest: options.useLatest,
       createPreRestoreBackup: options.createPreRestoreBackup,
-      stopWriters: options.stopWritersCommand,
-      startWriters: options.startWritersCommand,
+      stopWriters: stopWritersCommand,
+      startWriters: startWritersCommand,
       allowOnlineRestore: options.allowOnlineRestore,
       skipVerify: options.skipVerify,
     });
@@ -2914,10 +3612,13 @@ async function runCli(argv = process.argv.slice(2)) {
 
 module.exports = {
   DEFAULT_RETENTION_POLICY,
+  buildGfsAnchors,
   buildDailyCronEntry,
   listBackupsWithPlan,
   pruneBackupsJob,
   resolveRetentionPolicy,
+  resolveDestinations,
+  normalizeDestination,
   planRetention,
   restoreBackup,
   runBackupJob,

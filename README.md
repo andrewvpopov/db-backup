@@ -15,10 +15,84 @@ npm install github:andrewpopov/db-backup#v0.11.1
 
 ## Retention
 
-Three retention strategies. **Age-tier** is the default; **keep-last** and
-**keep-days** are flat alternatives. The modes are mutually exclusive — pick one.
+Four retention strategies. **Age-tier** is the default; **keep-last** and
+**keep-days** are flat alternatives; **GFS** (grandfather-father-son) is a
+fully configurable declarative policy applied identically to every
+destination. The modes are mutually exclusive — pick one; combining flags
+from two modes is an error, not a silent pick.
 
-### Age-tier (default)
+### GFS (grandfather-father-son) — the recommended way to configure retention
+
+```bash
+db-backup backup --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 2
+```
+
+means: keep the **7 most-recent** backups as daily slots, then **one backup
+per week** for 4 weeks, **one backup per month** for 12 months, and **one
+backup per year** for 2 years. A backup is kept if it is the newest backup in
+*any* bucket it qualifies for; everything else is pruned. A backup that is
+simultaneously the newest of its week *and* its month is kept once, not
+double-counted.
+
+Programmatically, the same policy object works everywhere `policy` is
+accepted:
+
+```js
+const policy = { mode: 'gfs', daily: 7, weekly: 4, monthly: 12, yearly: 2 };
+await runBackupJobAsync({ destinations: [...], policy });
+```
+
+**Worked example.** Given nightly backups going back 14 months, this policy
+keeps: the 7 most-recent nights; the single newest backup from each of the 4
+weeks before that; the single newest backup from each of the 12 (30-day)
+months before that; nothing yet from the yearly tier (the oldest backup is
+younger than a year). Total kept count is bounded by
+`daily + weekly + monthly + yearly` (23 here) but is usually lower, since a
+backup already kept by a narrower tier (daily) also satisfies any broader
+tier (weekly/monthly/yearly) whose window it falls in — it is never kept
+twice.
+
+**Not a parallel retention system.** GFS reuses the exact same "slots +
+anchors" engine the age-tier default already used: `daily` is mechanically
+identical to `dailySlots` (the N most-recent backups, no age math), and
+`weekly`/`monthly`/`yearly` are generated as `RetentionAnchor`s — one per
+bucket, each targeting the newest backup within it. For anything the
+generated buckets can't express, supply your own `anchors` — either
+programmatically or via a JSON file:
+
+```bash
+db-backup backup --retention-policy ./retention.json
+```
+
+```json
+{
+  "mode": "gfs",
+  "daily": 7,
+  "anchors": [
+    { "key": "black_friday", "label": "Black Friday snapshot", "minAgeDays": 300, "maxAgeDays": 400, "targetAgeDays": 330 }
+  ]
+}
+```
+
+`--retention-policy` accepts ANY policy shape (GFS, age-tier, or a flat
+mode) — it is the full escape hatch, and cannot be combined with any other
+retention flag.
+
+**Sanity-check a policy before trusting it** with `--dry-run`:
+
+```bash
+db-backup prune --retain-daily 7 --retain-weekly 4 --dry-run
+# [db-backup] DRY RUN — nothing will be deleted.
+#   KEEP   | sqlite-backup-20260713-030000Z.db.gz | Daily slot 1 | 2.1 MB
+#   KEEP   | sqlite-backup-20260706-030000Z.db.gz | Weekly slot 2 | 2.0 MB
+#   DELETE | sqlite-backup-20260705-030000Z.db.gz | Rotate out | 2.0 MB
+# [db-backup] Would keep 2 backup(s), would remove 1 backup(s).
+```
+
+Nothing is deleted in `--dry-run` mode, and every survivor's line names the
+exact reason it was kept.
+
+### Age-tier (legacy default)
 
 Tunable via `--max-backups` / `--daily-slots` or the `DB_BACKUP_MAX_BACKUPS` /
 `DB_BACKUP_DAILY_SLOTS` env vars:
@@ -30,7 +104,9 @@ Tunable via `--max-backups` / `--daily-slots` or the `DB_BACKUP_MAX_BACKUPS` /
 - Always keep **1 backup from two months ago**
 
 The age-tier anchors (week/month/two-months) are policy-owned; only the total
-cap and daily-slot count are exposed on the CLI.
+cap and daily-slot count are exposed on the CLI. **Unchanged** — this remains
+the default when no other retention flag is given, exactly as before GFS
+existed.
 
 ### Flat retention
 
@@ -44,7 +120,7 @@ db-backup backup --prod --keep-last 8      # e.g. 8 weekly backups
 db-backup prune  --keep-days 30            # e.g. a 30-day window
 ```
 
-Notes:
+Notes (apply to every mode, including GFS):
 
 - **`keep-days` always retains the single most-recent backup**, even when it is
   older than the window. A long gap between runs can never delete every backup.
@@ -52,11 +128,108 @@ Notes:
   everything".
 - A backup dated in the future (clock skew) is clamped to *now* for both
   ordering and age, so it is treated as brand new rather than as negative-age.
-- **Precedence:** an explicit CLI argument always beats an env var. Combining a
-  flat option with `--max-backups`/`--daily-slots` is an error, and so is passing
-  both `--keep-last` and `--keep-days`. An env var selects a flat mode only when
-  no retention option was passed explicitly, so a stale `DB_BACKUP_KEEP_LAST`
-  cannot silently override an explicit `--max-backups`.
+- **Precedence:** an explicit CLI argument always beats an env var. Combining
+  options from two different retention modes (e.g. `--retain-daily` with
+  `--keep-last`, or `--max-backups` with `--keep-days`) is an error, not a
+  silent pick. An env var selects a flat mode only when no retention option
+  was passed explicitly, so a stale `DB_BACKUP_KEEP_LAST` cannot silently
+  override an explicit `--max-backups`.
+- **The newest backup is NEVER pruned**, whatever the policy computes — a
+  hard safety guard inside `planRetention` itself, so it applies to every
+  caller (backup, prune, list) and every destination (local, rclone, S3)
+  uniformly. A policy whose own selection would keep *nothing* (while
+  backups exist) THROWS rather than silently emptying the backup directory.
+
+## Destinations: WHERE backups go
+
+`destinations` (and its CLI form, repeatable `--dest`) is an explicit list of
+where a backup is replicated to — orthogonal to `policy` (**which**/how many
+survive). This is the new, recommended way to configure location; the legacy
+`--output-dir`/`--remote`/`--s3-bucket`/`--skip-remote` flags keep working
+exactly as before (see below) and cannot be mixed with `--dest`.
+
+```bash
+db-backup backup \
+  --dest local:/srv/app/backups \
+  --dest s3:andrewpopov-db-backups/daily/app \
+  --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 2
+```
+
+```js
+await runBackupJobAsync({
+  destinations: [
+    { type: 'local', path: '/srv/app/backups' },
+    { type: 's3', bucket: 'andrewpopov-db-backups', prefix: 'daily/app' },
+    // { type: 'rclone', target: 'r2:backups/app' },
+  ],
+  policy: { mode: 'gfs', daily: 7, weekly: 4, monthly: 12, yearly: 2 },
+});
+```
+
+- **`local` is not a privileged default.** A caller may configure `s3`-only
+  (or `rclone`-only) — the backup is staged on disk, uploaded, verified, and
+  then the local staging copy is removed, exactly like today's `skipRemote`
+  never leaving a phantom local file, but without requiring a local
+  destination to exist at all.
+- **Zero destinations aborts** — "you must choose where backups go" — the
+  same fail-closed spirit as the local-only guard below, generalized to any
+  number of destinations.
+- **One retention plan drives every destination.** Once a GFS policy
+  (`--retain-*`/`--retention-policy`/a `policy` with `mode: 'gfs'`) is
+  configured, `planRetention` runs against each destination's own listing and
+  produces the exact same keep/remove decision everywhere — local and S3 (or
+  rclone) can no longer drift apart. Without a GFS policy, each remote
+  destination keeps its own legacy flat count (`--remote-keep`, default 30),
+  exactly as before this release.
+- **Legacy flags map onto the same `destinations` shape internally** — there
+  is one retention/distribution engine underneath both models, not two.
+  `--remote <target>` and `--s3-bucket <name>` continue to work exactly as
+  documented in [Off-host replication](#off-host-replication) below; mixing
+  them with `--dest` is an error.
+
+## `db-backup.config.json`
+
+An app with a fixed backup setup can declare it once instead of re-typing the
+same ~10 flags in a deploy script:
+
+```json
+{
+  "databaseUrl": "file:/srv/cairn/packages/api/prisma/cairn.db",
+  "destinations": [
+    { "type": "local", "path": "/srv/cairn-backups" },
+    { "type": "s3", "bucket": "andrewpopov-db-backups", "prefix": "daily/cairn" }
+  ],
+  "retention": { "daily": 7, "weekly": 4, "monthly": 12, "yearly": 2 },
+  "encryptPassphraseFile": "/var/lib/cairn/secrets/backup.pass",
+  "minBytes": 1048576,
+  "commandTimeoutSeconds": 900,
+  "stampFile": "/srv/cairn-backups/.last-success",
+  "stopWritersCmd": "pm2 stop cairn-app",
+  "startWritersCmd": "pm2 start cairn-app"
+}
+```
+
+```bash
+db-backup backup --config db-backup.config.json
+# or, with a file named exactly db-backup.config.json in the cwd:
+db-backup backup
+```
+
+Resolution order: explicit `--config <path>` > `db-backup.config.json` in the
+current directory > none. **CLI flags always override a config value; a
+config value always overrides the built-in default.**
+
+- **Never put credentials in this file.** A config that sets
+  `accessKeyId`/`secretAccessKey`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+  (at the top level or on a destination) is REJECTED outright — S3
+  credentials remain environment-only.
+- **An unreadable `encryptPassphraseFile` aborts before any backup work**,
+  whether it came from the config or `--encrypt-passphrase-file` — this used
+  to only surface after a wasted snapshot, at gpg-invocation time.
+- **Zero destinations aborts**, same as the `destinations` option above.
+- Mixing a config's `destinations`/`retention` with the legacy location/
+  retention flags is an error, same rule as mixing `--dest`/`--retain-*` with
+  the legacy flags.
 
 ## Encryption at rest
 
@@ -227,7 +400,10 @@ secret key.
 - **Remote retention:** `--remote-keep <n>` (default 30) works the same way
   it does for rclone — the bucket/prefix is listed and the oldest objects
   beyond `n` are deleted, never including the object just uploaded and
-  verified.
+  verified. **Only applies when no GFS policy is configured** — once
+  `--retain-*`/`--retention-policy` (or a `policy` with `mode: 'gfs'`) is set,
+  S3 (like rclone) follows that SAME unified plan instead; see
+  [Destinations: WHERE backups go](#destinations-where-backups-go).
 
 ## Backup liveness
 
@@ -289,6 +465,18 @@ db-backup list --output-dir /var/backups/myapp
 
 # Apply retention now without taking a new backup (no DB needed)
 db-backup prune --output-dir /var/backups/myapp --max-backups 6
+
+# Sanity-check a GFS policy before trusting it — prints the plan, deletes nothing
+db-backup prune --output-dir /var/backups/myapp \
+  --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 2 --dry-run
+
+# Declarative: destinations + a GFS policy applied identically everywhere
+db-backup backup \
+  --dest local:/var/backups/myapp --dest s3:my-bucket/myapp \
+  --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 2
+
+# Or collapse the above into a config file (see `db-backup.config.json` above)
+db-backup backup --config db-backup.config.json
 
 # Print a copy-pasteable cron entry for daily execution
 db-backup cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp
