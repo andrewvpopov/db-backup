@@ -1,4 +1,5 @@
 import { createRequire } from 'module';
+import { execFileSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -83,7 +84,7 @@ describe('@andrewpopov/db-backup', () => {
     const outputDir = path.join(cwd, 'backups');
     fs.writeFileSync(sourcePath, 'sqlite bytes');
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./db%20with%20spaces.db?connection_limit=1',
       outputDir,
@@ -107,7 +108,7 @@ describe('@andrewpopov/db-backup', () => {
     const outputDir = path.join(cwd, 'backups');
     fs.writeFileSync(sourcePath, 'sqlite bytes');
 
-    const first = runBackupJob({
+    const first = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
@@ -115,7 +116,7 @@ describe('@andrewpopov/db-backup', () => {
       allowUnsafeCopy: true,
     });
     fs.writeFileSync(sourcePath, 'new sqlite bytes');
-    const second = runBackupJob({
+    const second = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
@@ -157,7 +158,7 @@ describe('@andrewpopov/db-backup', () => {
     });
 
     const rawPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./dev.db',
@@ -204,7 +205,7 @@ describe('@andrewpopov/db-backup', () => {
     });
 
     expect(() =>
-      runBackupJob({ cwd, databaseUrl: 'file:./dev.db', outputDir, compressSqlite: false, runtime }),
+      runBackupJob({ skipRemote: true, cwd, databaseUrl: 'file:./dev.db', outputDir, compressSqlite: false, runtime }),
     ).toThrow(/integrity check failed/i);
     // The corrupt snapshot must not be left behind.
     expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir) : []).toEqual([]);
@@ -222,7 +223,7 @@ describe('@andrewpopov/db-backup', () => {
     try {
       process.env.DATABASE_URL = 'file:./does-not-exist-δ.db';
       process.env.NODE_ENV = 'development';
-      expect(() => runCli(['backup', '--allow-missing', '--output-dir', outputDir])).not.toThrow();
+      expect(() => runCli(['backup', '--allow-missing', '--skip-remote', '--output-dir', outputDir])).not.toThrow();
       expect(logs.some((line) => /skipping backup/.test(line))).toBe(true);
       // Nothing should have been written.
       expect(fs.readdirSync(outputDir)).toEqual([]);
@@ -251,7 +252,7 @@ describe('@andrewpopov/db-backup', () => {
       },
     });
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl,
@@ -290,8 +291,8 @@ describe('@andrewpopov/db-backup', () => {
       },
     });
 
-    const first = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
-    const second = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
+    const first = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
+    const second = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
 
     expect(first.created.fileName).toBe('postgres-backup-20260705-150000Z.dump');
     expect(second.created.fileName).toBe('postgres-backup-20260705-150000Z-2.dump');
@@ -720,7 +721,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(dbPath, 'database');
 
     expect(() =>
-      runBackupJob({
+      runBackupJob({ skipRemote: true,
         cwd,
         databaseUrl: 'file:./app.db',
         outputDir: path.join(cwd, 'backups'),
@@ -912,7 +913,7 @@ describe('@andrewpopov/db-backup', () => {
     }
 
     // fixedNow is 2026-07-05 — earlier than both, i.e. the clock went backward.
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./app.db',
@@ -934,7 +935,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(path.join(cwd, 'app.db'), 'x');
 
     expect(() =>
-      runBackupJob({
+      runBackupJob({ skipRemote: true,
         allowUnsafeCopy: true,
         cwd,
         databaseUrl: 'file:./app.db',
@@ -958,7 +959,7 @@ describe('@andrewpopov/db-backup', () => {
 
     // A run that fails the size floor must leave no stamp behind.
     expect(() =>
-      runBackupJob({
+      runBackupJob({ skipRemote: true,
         allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
         compressSqlite: false, minBytes: 32768, stampFile, runtime: makeRuntime(),
       }),
@@ -966,7 +967,7 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(stampFile), 'a failed run must not stamp success').toBe(false);
 
     // A clean run stamps.
-    runBackupJob({
+    runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
       compressSqlite: false, stampFile, runtime: makeRuntime(),
     });
@@ -1171,6 +1172,121 @@ describe('@andrewpopov/db-backup', () => {
     expect(result.uploaded).toBeNull();
   });
 
+  it('refuses a silent local-only backup: no --remote and no --skip-remote aborts, and leaves no backup file', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/Refusing to create a local-only backup.*--remote.*--skip-remote/s);
+
+    // No backup file, no output dir, nothing implying success.
+    expect(fs.existsSync(outputDir)).toBe(false);
+  });
+
+  it('CLI backup with neither --remote nor --skip-remote aborts', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const originalUrl = process.env.DATABASE_URL;
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      process.env.DATABASE_URL = 'file:./app.db';
+      process.env.NODE_ENV = 'development';
+      expect(() =>
+        runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy']),
+      ).toThrow(/Refusing to create a local-only backup/);
+      expect(fs.existsSync(outputDir)).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('a remote configured (no --skip-remote) succeeds and uploads as before', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) => {
+        if (args[0] === 'lsjson') {
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-'))!;
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
+        }
+        return Buffer.from('');
+      }) as never,
+    });
+
+    const result = runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      remote: { target: 'offsite:x' }, runtime,
+    });
+
+    expect(result.uploaded).not.toBeNull();
+    expect(result.localOnly).toBe(false);
+  });
+
+  it('skipRemote: true with no remote succeeds (explicit opt-out) and surfaces a localOnly warning', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => { warnings.push(String(message)); };
+
+    let result;
+    try {
+      result = runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+        skipRemote: true, runtime: makeRuntime(),
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
+    expect(result.localOnly).toBe(true);
+    expect(warnings.some((w) => /local-only backup/i.test(w))).toBe(true);
+  });
+
+  it('CLI --skip-remote with no --remote succeeds', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    // A real (if minimal) SQLite file — this exercises the actual sqlite3
+    // binary via runCli (no injected runtime), which rejects non-database bytes.
+    execFileSync('sqlite3', [path.join(cwd, 'app.db'), 'CREATE TABLE t (a INTEGER);']);
+    const originalUrl = process.env.DATABASE_URL;
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      process.env.DATABASE_URL = 'file:./app.db';
+      process.env.NODE_ENV = 'development';
+      expect(() =>
+        runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy', '--skip-remote']),
+      ).not.toThrow();
+      expect(fs.readdirSync(outputDir).some((f) => f.startsWith('sqlite-backup-'))).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
   it('remote prune never deletes the object it just uploaded', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
@@ -1218,7 +1334,7 @@ describe('@andrewpopov/db-backup', () => {
       const stampFile = path.join(outputDir, '.last-success');
       fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
 
-      const result = runBackupJob({
+      const result = runBackupJob({ skipRemote: true,
         allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
         compressSqlite: false, stampFile, runtime: makeRuntime(),
       });
@@ -1241,7 +1357,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.chmodSync(outputDir, 0o750); // operator's choice, e.g. group-readable
     fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
 
-    runBackupJob({
+    runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
       compressSqlite: false, runtime: makeRuntime(),
     });
@@ -1256,7 +1372,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.mkdirSync(outputDir, { recursive: true });
     fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
       compressSqlite: false, namePrefix: 'smarthome', runtime: makeRuntime(),
     });
@@ -1280,7 +1396,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(path.join(outputDir, 'notes.db'), 'not a backup');
 
     // keep-last:1 would prune everything it can see.
-    runBackupJob({
+    runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
       compressSqlite: false, namePrefix: 'smarthome',
       policy: { mode: 'keep-last', keepLast: 1 }, runtime: makeRuntime(),
@@ -1558,7 +1674,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(dbPath, originalBytes);
 
     const runtime = makeRuntime({ commandExists: () => false });
-    const created = runBackupJob({
+    const created = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./data/app.db',
@@ -1592,11 +1708,11 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(dbPath, 'version 1');
 
     const olderRuntime = makeRuntime({ now: () => new Date('2026-07-01T00:00:00.000Z') });
-    runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: olderRuntime, allowUnsafeCopy: true });
+    runBackupJob({ skipRemote: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: olderRuntime, allowUnsafeCopy: true });
 
     fs.writeFileSync(dbPath, 'version 2');
     const newerRuntime = makeRuntime({ now: () => new Date('2026-07-05T00:00:00.000Z') });
-    const second = runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: newerRuntime, allowUnsafeCopy: true });
+    const second = runBackupJob({ skipRemote: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: newerRuntime, allowUnsafeCopy: true });
 
     fs.writeFileSync(dbPath, 'mutated after both backups');
 
@@ -1739,7 +1855,7 @@ describe('@andrewpopov/db-backup', () => {
       },
     });
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./dev.db',
@@ -1765,7 +1881,7 @@ describe('@andrewpopov/db-backup', () => {
     const originalUrl = process.env.DATABASE_URL;
     try {
       delete process.env.DATABASE_URL;
-      const result = runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true });
+      const result = runBackupJob({ skipRemote: true, cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true });
       expect(fs.readFileSync(result.created.fullPath, 'utf8')).toBe('prod bytes');
     } finally {
       if (originalUrl === undefined) delete process.env.DATABASE_URL;
@@ -1782,7 +1898,7 @@ describe('@andrewpopov/db-backup', () => {
     try {
       delete process.env.DATABASE_URL;
       expect(() =>
-        runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true }),
+        runBackupJob({ skipRemote: true, cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true }),
       ).toThrow(/production backups/i);
     } finally {
       if (originalUrl === undefined) delete process.env.DATABASE_URL;
@@ -1815,7 +1931,7 @@ describe('@andrewpopov/db-backup', () => {
       },
     });
 
-    expect(() => runBackupJob({ cwd, databaseUrl, outputDir, runtime })).toThrow(
+    expect(() => runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime })).toThrow(
       /PostgreSQL backup verification failed/i,
     );
     const dumpFiles = fs.existsSync(outputDir)
@@ -1839,7 +1955,7 @@ describe('@andrewpopov/db-backup', () => {
       },
     });
 
-    const result = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
+    const result = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
     expect(fs.existsSync(result.created.fullPath)).toBe(true);
   });
 
@@ -1855,7 +1971,7 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, at: fixedNow.toISOString(), token: 'someone-else' }));
 
     expect(() =>
-      runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: makeRuntime() }),
+      runBackupJob({ skipRemote: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: makeRuntime() }),
     ).toThrow(/holds the lock/i);
 
     expect(fs.existsSync(lockPath)).toBe(true);
@@ -1871,7 +1987,7 @@ describe('@andrewpopov/db-backup', () => {
     const staleAt = new Date(fixedNow.getTime() - 60 * 60 * 1000).toISOString(); // 1h old, > default 30m staleMs
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, at: staleAt, token: 'stale-token' }));
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
@@ -1893,7 +2009,7 @@ describe('@andrewpopov/db-backup', () => {
     const lockPath = path.join(outputDir, '.db-backup.lock');
     fs.writeFileSync(lockPath, ''); // zero-byte, unparsable — a crashed run's leftover
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
@@ -1912,7 +2028,7 @@ describe('@andrewpopov/db-backup', () => {
     const lockPath = path.join(outputDir, '.db-backup.lock');
 
     expect(() =>
-      runBackupJob({
+      runBackupJob({ skipRemote: true,
         cwd,
         databaseUrl: 'file:./missing.db',
         outputDir,
@@ -1995,7 +2111,7 @@ describe('@andrewpopov/db-backup', () => {
     const outputDir = path.join(cwd, 'backups');
     fs.writeFileSync(sourcePath, 'sqlite bytes');
 
-    const result = runBackupJob({
+    const result = runBackupJob({ skipRemote: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
@@ -2021,7 +2137,7 @@ describe('@andrewpopov/db-backup', () => {
     const outputDir = path.join(cwd, 'backups');
     fs.writeFileSync(sourcePath, 'sqlite bytes');
 
-    const created = runBackupJob({
+    const created = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./app.db',

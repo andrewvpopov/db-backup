@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.15.0
+
+**Data-loss fix — `backup` with no offsite remote configured and no explicit
+`--skip-remote` now ABORTS instead of silently producing a same-disk-only
+"backup".**
+
+`runBackupJob` only uploaded off-host when `remote` was configured; if it
+wasn't, the run just quietly finished as a local-only success — no error, no
+warning, nothing distinguishing it from a real, replicated backup. Consumer
+side, cairn's `package.json` passes `--skip-remote` **unconditionally**, so
+its only backups have always sat on the same disk as its prod database: one
+disk failure loses both the database and every "backup" of it. rouge already
+guards against exactly this in `deploy/backup-rouge-db.sh` — the wrapper
+fails closed unless `ROUGE_BACKUP_REMOTE` is set or the operator opts in with
+`ROUGE_BACKUP_ALLOW_LOCAL_ONLY=1` — and that logic is now baked into the
+package itself so every consumer gets it for free, not just the one that
+happened to hand-roll it.
+
+- **`backup` refuses to run** (CLI and `runBackupJob`) when neither `--remote`
+  / `remote` nor `--skip-remote` / `skipRemote: true` is set. The error names
+  both escape hatches: configure `--remote <dest>` for offsite replication, or
+  pass `--skip-remote` (`skipRemote: true`) to explicitly accept the
+  same-disk risk. Nothing is written — no backup file, no output directory —
+  before this check runs.
+- `--skip-remote` / `skipRemote: true` remains a fully valid, explicit
+  opt-out (this is how cairn and local dev already run) — it is not removed
+  or restricted, only required to be a deliberate choice instead of an
+  implicit default.
+- `BackupJobResult` gained `localOnly: boolean`. When `true`, the CLI and a
+  `console.warn` both surface a visible warning that the run has no offsite
+  copy.
+- `restore` / `prune` / `list` are unaffected — they don't produce new backup
+  artifacts, so there is no silent-local-only failure mode for them to guard
+  against.
+
+No new runtime dependencies; freshness/dead-man's-switch support
+(`--stamp-file`, `--max-age-hours`, `checkBackupFreshness`,
+`checkRemoteFreshness`) already existed from earlier releases and needed no
+changes for this fix.
+
 ## 0.14.0
 
 **Data-loss fix — `restore` against a LIVE, running database now ABORTS

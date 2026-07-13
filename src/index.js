@@ -2276,6 +2276,25 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
 
 function runBackupJob(options = {}) {
   const resolved = resolveBackupOptions(options);
+
+  // Fail closed on a silent same-disk-only "backup". A backup that lives only
+  // on the disk that holds the database is not a backup — one disk failure
+  // loses both copies. This must be a DELIBERATE choice, so the caller has to
+  // either configure offsite replication or explicitly opt in to the risk.
+  // No file is created and nothing is left implying success. See rouge's
+  // deploy/backup-rouge-db.sh (ROG-1138): a hand-rolled wrapper already learned
+  // this the hard way — "no offsite" produced nine silent nights of local-only
+  // backups before anyone noticed.
+  const localOnly = resolved.skipRemote === true && !resolved.remote;
+  if (!resolved.remote && !resolved.skipRemote) {
+    throw new Error(
+      'Refusing to create a local-only backup: no --remote is configured and --skip-remote ' +
+      'was not passed. A backup on the same disk as the database is not a backup — a single ' +
+      'disk failure destroys both. Configure --remote <dest> (offsite replication via rclone), ' +
+      'or pass --skip-remote (skipRemote: true) to explicitly accept the same-disk risk.',
+    );
+  }
+
   ensureBackupDir(resolved.outputDir);
 
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
@@ -2289,6 +2308,11 @@ function runBackupJob(options = {}) {
     let uploaded = null;
     if (resolved.remote && !resolved.skipRemote) {
       uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
+    } else if (localOnly) {
+      console.warn(
+        '[db-backup] WARNING: local-only backup (skipRemote explicitly set, no remote ' +
+        'configured). This backup exists only on the same disk as the database.',
+      );
     }
 
     const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
@@ -2342,6 +2366,7 @@ function runBackupJob(options = {}) {
       mode: resolved.mode,
       outputDir: resolved.outputDir,
       policy: resolved.policy,
+      localOnly,
     };
   });
 }
@@ -2673,6 +2698,11 @@ function runCli(argv = process.argv.slice(2)) {
 
   if (result.removed.length > 0) {
     console.log(`[db-backup] Removed: ${result.removed.map((entry) => entry.fileName).join(', ')}`);
+  }
+  if (result.localOnly) {
+    console.log(
+      '[db-backup] WARNING: local-only backup — no remote configured, --skip-remote was set explicitly.',
+    );
   }
 }
 
