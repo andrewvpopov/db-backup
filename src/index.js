@@ -614,7 +614,7 @@ function parseTimestampKey(timestampKey) {
 
 function commandExists(command, runner = execFileSync) {
   try {
-    runner('sh', ['-lc', `command -v ${command}`], { stdio: 'ignore' });
+    runner('sh', ['-c', `command -v ${command}`], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
