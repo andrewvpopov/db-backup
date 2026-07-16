@@ -11,6 +11,42 @@ silently break restore correlation. `backupId` is the documented, stable
 contract for that use case; see the new "Machine-readable output" README
 section. Additive only — all existing fields are unchanged.
 
+**Lifecycle/freshness surfaces for admin composition (PKG-28).** Every
+`BackupEntry` now carries a `state`: `'completed'` for a real on-disk
+artifact (unchanged behavior), plus two new states backed by lightweight
+markers so an in-flight or crashed job is representable at all:
+
+- `'running'` — a `<fileName>.inprogress` marker, written the instant a job
+  starts and removed the instant it finishes successfully.
+- `'failed'` — a `<fileName>.failed` marker (the `.inprogress` marker
+  renamed in place), holding `{ startedAt, error }` with the error message
+  truncated so a huge stack trace can't bloat the backup directory.
+
+Markers carry no size requirement and are always excluded from retention
+**selection** (`planRetention` never sees them). A stale `.failed` marker —
+older than the oldest backup the policy is still keeping — is folded into
+the removal plan by `listBackupsWithPlan`/`pruneBackupsJob` for cleanup
+(`retentionReason: 'stale_marker'`); a `.running` marker is never swept this
+way. New export `listBackupMarkers(outputDir, now?, namePrefix?)` surfaces
+markers directly as `BackupEntry`-shaped rows.
+
+New export `getOperationalStatus({ stampFile, outputDir?, maxAgeHours?, now?,
+namePrefix? })` combines `checkBackupFreshness` with the newest known entry's
+lifecycle state into `{ tone: 'healthy' | 'warning' | 'critical', detail,
+stampedAt? }` — the natural feed for admin-kit's `AdminOperationalStatus`.
+Precedence: a failed marker beats a fresh stamp (critical) > clock skew
+(warning) > stale (critical) > healthy. See the new README "Backup lifecycle
+states and markers" / "Operational status (admin surfaces)" sections.
+
+Additive only — every existing `BackupEntry` consumer is unaffected; `state`
+and `error` are new optional fields.
+
+Also: the `__tests__` suite (previously one ~3,700-line file) is now split
+into per-area files (`backup-job`, `retention`, `restore`, `cli`,
+`destinations-replication`, `freshness`, `encryption`) sharing fixtures via
+`__tests__/helpers.ts`. No test logic changed; same tests, same assertions,
+now organized by area, plus new coverage for the surfaces above.
+
 ## 0.17.2
 
 - Add public contribution, support, and private vulnerability-reporting policies.

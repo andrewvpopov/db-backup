@@ -419,6 +419,60 @@ db-backup freshness --stamp-file /var/lib/app/backups/.last-success --max-age-ho
 ever recorded**. Pair it with `--min-bytes` so a truncated database — which passes
 `PRAGMA integrity_check` — fails loudly instead of rotating out a good backup.
 
+### Backup lifecycle states and markers
+
+Every `BackupEntry` (from `listBackupsWithPlan`, `listBackups`, etc.) carries a `state`:
+
+| state | meaning |
+|---|---|
+| `completed` | Backed by a real, verified artifact on disk — every entry that existed before this field was added. |
+| `running` | A job is currently working on this backup. Represented by a `<fileName>.inprogress` marker written the instant the job starts, removed the instant it finishes successfully. |
+| `failed` | The job that would have produced this backup threw. Represented by a `<fileName>.failed` marker — the `.inprogress` marker renamed in place, holding a small JSON body `{ startedAt, error }` (the error message truncated so a huge stack trace can't bloat the backup directory). |
+
+Markers are not backups: they carry no size requirement and are always excluded from
+retention **selection** — `planRetention` never sees them, so a stuck or failed run
+can never occupy a keep slot or influence which real backups rotate out. A `.failed`
+marker is still swept for cleanup once it's older than the oldest backup the policy is
+still keeping (`listBackupsWithPlan`/`pruneBackupsJob` fold it into the removal plan
+with `retentionReason: 'stale_marker'`); a `.running` marker is never swept this way — a
+stuck job is an operational fact worth keeping visible, not tidying away.
+
+```js
+const { listBackupsWithPlan } = require('@andrewpopov/db-backup');
+
+const { backups } = listBackupsWithPlan({ outputDir: '/var/lib/app/backups' });
+backups.forEach((b) => console.log(b.fileName, b.state, b.error || ''));
+```
+
+### Operational status (admin surfaces)
+
+`getOperationalStatus` combines `checkBackupFreshness` with the newest known entry's
+lifecycle state into a single `{ tone, detail, stampedAt? }` — the natural feed for an
+admin dashboard's status widget (e.g. admin-kit's `AdminOperationalStatus`):
+
+```js
+const { getOperationalStatus } = require('@andrewpopov/db-backup');
+
+const status = getOperationalStatus({
+  stampFile: '/var/lib/app/backups/.last-success',
+  outputDir: '/var/lib/app/backups',
+  maxAgeHours: 36,
+});
+// { tone: 'healthy' | 'warning' | 'critical', detail: '...', stampedAt?: '...' }
+```
+
+Tone precedence, most to least urgent (documented here because it is the one place the
+ordering is decided):
+
+1. **The newest entry is a `failed` marker → `critical`.** A failed run beats a fresh
+   stamp: the stamp only proves a *past* success, and an operator needs to know the
+   *most recent* attempt didn't work even while an older backup is still inside the
+   freshness window.
+2. **The stamp is dated in the future (clock skew) → `warning`.** The data may well be
+   fine; the clock is not, and that's a different problem than a stale backup.
+3. **The stamp is stale (not fresh, no clock skew) → `critical`.**
+4. **Otherwise → `healthy`.**
+
 ### Off-host dead-man's switch (remote freshness + alerts)
 
 A local `--stamp-file` check runs *on the backup host* — so it dies with the host, and

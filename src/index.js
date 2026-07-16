@@ -1580,6 +1580,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
     fullPath: finalPath,
     engine: 'sqlite',
     compressed,
+    state: 'completed',
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
     sha256: sha256File(finalPath),
@@ -1615,6 +1616,7 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     fullPath,
     engine: 'postgres',
     compressed: false,
+    state: 'completed',
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
     sha256: sha256File(fullPath),
@@ -1684,6 +1686,7 @@ function getBackupEntryFromPath(backupPath, now = new Date(), namePrefix = null)
     engine: parsed.engine,
     compressed: parsed.compressed,
     encrypted: Boolean(parsed.encrypted),
+    state: 'completed',
     createdAt: createdAt.toISOString(),
     sizeBytes: stats.size,
     ageDays,
@@ -2180,6 +2183,7 @@ function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date(), namePre
         fullPath,
         engine: parsed.engine,
         compressed: parsed.compressed,
+        state: 'completed',
         createdAt: createdAt.toISOString(),
         sizeBytes: fileStats.size,
         ageDays,
@@ -2194,6 +2198,135 @@ function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date(), namePre
     .map(({ _sortSequence, ...entry }) => entry);
 
   return files;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle markers.
+//
+// A backup job that is in flight, or one that died mid-run, leaves no on-disk
+// artifact for listBackups to find — an admin surface has no way to tell
+// "nothing has run yet" from "a run is stuck" or "the last run crashed".
+// Markers close that gap without touching the backup-file format itself:
+//
+//   <fileName>.inprogress  written the instant a job picks its filename and
+//                          starts working; removed the instant that job
+//                          finishes successfully.
+//   <fileName>.failed      the inprogress marker's replacement when the job
+//                          throws — a small JSON body { startedAt, error }
+//                          (error truncated to MARKER_ERROR_TRUNCATE_LENGTH so
+//                          a huge stack trace can't bloat the backup
+//                          directory).
+//
+// Markers are never counted as backups: no size requirement, and excluded
+// from every retention SELECTION (planRetention never sees them — see
+// listBackupsWithPlan). listBackupsWithPlan surfaces them purely for
+// observability, as entries with state 'running'/'failed'.
+//
+// Stale-marker cleanup rule (documented here because it is the one place the
+// rule is decided): a `.failed` marker whose age exceeds the oldest backup
+// the retention policy is still keeping is no longer useful information —
+// the policy has already moved past what it describes — so listBackupsWithPlan
+// folds it into `plan.remove` (retentionReason 'stale_marker'), which
+// pruneBackupsJob/finalizeBackupResult then delete exactly like a
+// rotated-out backup. A `.running` marker is never swept this way; a stuck
+// job is an operational fact worth keeping visible, not tidying away.
+const MARKER_SUFFIXES = { inProgress: '.inprogress', failed: '.failed' };
+const MARKER_ERROR_TRUNCATE_LENGTH = 500;
+
+function backupMarkerPath(outputDir, fileName, suffix) {
+  return path.join(outputDir, `${fileName}${suffix}`);
+}
+
+function readMarkerBody(fullPath) {
+  try {
+    return JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeInProgressMarker(outputDir, fileName, startedAt) {
+  const markerPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress);
+  fs.writeFileSync(markerPath, JSON.stringify({ startedAt: startedAt.toISOString() }));
+  return markerPath;
+}
+
+function clearInProgressMarker(outputDir, fileName) {
+  fs.rmSync(backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress), { force: true });
+}
+
+// Replaces the `.inprogress` marker with a `.failed` one holding the
+// truncated error message. Writes the failed marker FIRST, then removes the
+// in-progress one, so a crash between the two steps still leaves a marker
+// (the failed one) rather than silently reverting to "no marker at all".
+function failInProgressMarker(outputDir, fileName, startedAt, error) {
+  const inProgressPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress);
+  const failedPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.failed);
+  const message = String(error && error.message ? error.message : error).slice(0, MARKER_ERROR_TRUNCATE_LENGTH);
+  fs.writeFileSync(failedPath, JSON.stringify({ startedAt: startedAt.toISOString(), error: message }));
+  fs.rmSync(inProgressPath, { force: true });
+}
+
+// Surfaces every marker in outputDir as a BackupEntry-shaped row (state
+// 'running' | 'failed'), newest first. `sizeBytes` is always 0 — markers are
+// not backups and carry no size requirement.
+function listBackupMarkers(outputDir, now = new Date(), namePrefix = null) {
+  const absoluteOutputDir = path.resolve(outputDir);
+  if (!fs.existsSync(absoluteOutputDir)) {
+    return [];
+  }
+
+  const results = [];
+  for (const file of fs.readdirSync(absoluteOutputDir)) {
+    let state = null;
+    let baseName = null;
+    if (file.endsWith(MARKER_SUFFIXES.inProgress)) {
+      state = 'running';
+      baseName = file.slice(0, -MARKER_SUFFIXES.inProgress.length);
+    } else if (file.endsWith(MARKER_SUFFIXES.failed)) {
+      state = 'failed';
+      baseName = file.slice(0, -MARKER_SUFFIXES.failed.length);
+    } else {
+      continue;
+    }
+
+    const parsed = parseBackupFileName(baseName, namePrefix);
+    if (!parsed) {
+      continue;
+    }
+
+    const fullPath = path.join(absoluteOutputDir, file);
+    let startedAt = parseTimestampKey(parsed.timestampKey) || fs.statSync(fullPath).mtime;
+    let error;
+    const body = readMarkerBody(fullPath);
+    if (body) {
+      const parsedStartedAt = body.startedAt ? new Date(body.startedAt) : null;
+      if (parsedStartedAt && !Number.isNaN(parsedStartedAt.getTime())) {
+        startedAt = parsedStartedAt;
+      }
+      if (body.error) {
+        error = body.error;
+      }
+    }
+
+    const ageDays = Math.max(0, (now.getTime() - startedAt.getTime()) / DAY_MS);
+    results.push({
+      fileName: baseName,
+      fullPath,
+      engine: parsed.engine,
+      compressed: parsed.compressed,
+      state,
+      createdAt: startedAt.toISOString(),
+      sizeBytes: 0,
+      ageDays,
+      keep: state === 'running',
+      retentionReason: state === 'running' ? 'in_progress' : 'failed_marker',
+      retentionLabel: state === 'running' ? 'In progress' : 'Failed',
+      ...(error ? { error } : {}),
+    });
+  }
+
+  return results.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
 }
 
 function chooseAnchorCandidate(backups, anchor, now, excludedNames) {
@@ -2429,13 +2562,38 @@ function listBackupsWithPlan(options = {}) {
     };
   });
 
+  // Markers are never candidates for planRetention (they are excluded from
+  // the call above entirely) — but a `.failed` marker older than the oldest
+  // backup the plan is still keeping is folded into plan.remove for cleanup,
+  // per the rule documented on listBackupMarkers.
+  const markers = listBackupMarkers(resolved.outputDir, now, resolved.namePrefix);
+  const { markerRows, staleMarkers } = partitionStaleFailedMarkers(markers, plan);
+
   return {
-    backups: backupRows,
-    plan,
+    backups: [...backupRows, ...markerRows],
+    plan: { ...plan, remove: [...plan.remove, ...staleMarkers] },
     mode: resolved.mode,
     outputDir: resolved.outputDir,
     policy: resolved.policy,
   };
+}
+
+// Shared by listBackupsWithPlan and pruneBackupsJob: marks every `.failed`
+// marker older than the oldest backup the plan is still keeping as stale
+// (retentionReason 'stale_marker'), leaving `.running` markers and recent
+// failures untouched.
+function partitionStaleFailedMarkers(markers, plan) {
+  const oldestKeptAgeDays = plan.keep.reduce((max, entry) => Math.max(max, entry.ageDays || 0), 0);
+  const staleMarkers = [];
+  const markerRows = markers.map((marker) => {
+    if (marker.state === 'failed' && marker.ageDays > oldestKeptAgeDays) {
+      const stale = { ...marker, keep: false, retentionReason: 'stale_marker', retentionLabel: 'Stale failure marker' };
+      staleMarkers.push(stale);
+      return stale;
+    }
+    return marker;
+  });
+  return { markerRows, staleMarkers };
 }
 
 const LOCK_FILENAME = '.db-backup.lock';
@@ -2568,7 +2726,11 @@ function pruneBackupsJob(options = {}) {
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
     const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
     const plan = planRetention(backups, resolved.policy, now);
-    const removed = pruneBackups(plan.remove);
+
+    const markers = listBackupMarkers(resolved.outputDir, now, resolved.namePrefix);
+    const { staleMarkers } = partitionStaleFailedMarkers(markers, plan);
+
+    const removed = pruneBackups([...plan.remove, ...staleMarkers]);
 
     return {
       removed,
@@ -2851,6 +3013,74 @@ function checkRemoteFreshness({ remote, runtime = normalizeRuntime(), maxAgeHour
   return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
 }
 
+// Admin-surface feed: combines checkBackupFreshness with the newest known
+// entry's lifecycle state (a completed backup, or a running/failed marker —
+// see listBackupMarkers) into one { tone, detail, stampedAt? }, the natural
+// input for admin-kit's AdminOperationalStatus.
+//
+// Precedence, most to least urgent (documented here because it is the one
+// place the ordering is decided):
+//   1. The newest entry in outputDir is a FAILED marker -> 'critical'. A
+//      failed run beats a fresh stamp: the stamp only proves a PAST success,
+//      and an operator needs to know the MOST RECENT attempt didn't work even
+//      while an older backup is still inside the freshness window.
+//   2. The stamp is dated in the future (clock skew) -> 'warning'. The data
+//      may well be fine; the clock is not, and that is a different problem
+//      than a stale backup.
+//   3. The stamp is stale (not fresh, no clock skew) -> 'critical'.
+//   4. Otherwise -> 'healthy'.
+function getOperationalStatus({
+  stampFile,
+  outputDir,
+  maxAgeHours = 36,
+  now = new Date(),
+  namePrefix = null,
+} = {}) {
+  const freshness = checkBackupFreshness({ stampFile, maxAgeHours, now });
+
+  let newestEntry = null;
+  if (outputDir) {
+    const entries = [
+      ...listBackups({ outputDir, now, namePrefix }),
+      ...listBackupMarkers(outputDir, now, namePrefix),
+    ];
+    entries.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+    newestEntry = entries[0] || null;
+  }
+
+  if (newestEntry && newestEntry.state === 'failed') {
+    return {
+      tone: 'critical',
+      detail: `Last backup attempt failed${newestEntry.error ? `: ${newestEntry.error}` : ''}`,
+      ...(freshness.stampedAt ? { stampedAt: freshness.stampedAt.toISOString() } : {}),
+    };
+  }
+
+  if (freshness.clockSkew) {
+    return {
+      tone: 'warning',
+      detail: 'Last success is stamped in the future relative to this host’s clock',
+      stampedAt: freshness.stampedAt.toISOString(),
+    };
+  }
+
+  if (!freshness.fresh) {
+    return {
+      tone: 'critical',
+      detail: freshness.stampedAt
+        ? `Last successful backup is ${freshness.ageHours.toFixed(1)}h old (max ${freshness.maxAgeHours}h)`
+        : 'No successful backup has ever been recorded',
+      ...(freshness.stampedAt ? { stampedAt: freshness.stampedAt.toISOString() } : {}),
+    };
+  }
+
+  return {
+    tone: 'healthy',
+    detail: `Last successful backup is ${freshness.ageHours.toFixed(1)}h old (max ${freshness.maxAgeHours}h)`,
+    stampedAt: freshness.stampedAt.toISOString(),
+  };
+}
+
 // Best-effort alert delivery. NEVER throws and NEVER changes the exit code — a
 // failing webhook must not mask (or manufacture) a stale-backup verdict. Stays
 // synchronous (no fetch) so runCli's contract and every consumer's
@@ -3027,44 +3257,71 @@ function runBackupJob(options = {}) {
 
   ensureBackupDir(resolved.outputDir);
 
-  return withBackupLock(resolved.outputDir, resolved.runtime, () => {
-    // createBackup re-derives via resolveBackupOptions; `destinations` is
-    // already fully resolved here, so pass skipRemote:false to avoid it
-    // reading as a second, conflicting location model on re-entry.
-    const created = createBackup({ ...resolved, skipRemote: false });
-    const now = resolved.runtime.now();
-
-    warnIfLocalOnly(resolved, remoteDestinations);
-
-    // Replicate off-host BEFORE anything is pruned or stamped. A local-only
-    // backup dies with the disk it sits on; an unverified remote copy is not
-    // a backup. If any upload or its verification fails we throw here, so
-    // the previous good backups and the previous stamp both survive
-    // untouched at every destination, local included.
-    const distributions = remoteDestinations.map((destination) => ({
-      destination,
-      uploaded: uploadBackupToRemote(created, destination, resolved.runtime),
-      removed: [],
-    }));
-
-    // Retention is applied per destination only after EVERY destination has
-    // a verified copy — a prune must never run ahead of replication. The
-    // SAME policy drives every destination once a GFS policy is configured
-    // (resolveDestinationPolicy); otherwise each keeps its legacy count.
-    for (const distribution of distributions) {
-      const policy = resolveDestinationPolicy(distribution.destination, resolved);
-      distribution.removed = pruneRemoteBackups(
-        distribution.destination,
-        created.fileName,
-        resolved.runtime,
-        resolved.namePrefix,
-        policy,
-        now,
-      );
-    }
-
-    return finalizeBackupResult(resolved, created, now, distributions);
+  // Lifecycle marker: written before any work starts (see listBackupMarkers'
+  // doc comment), using the SAME filename-prediction logic createBackup uses
+  // internally (timestamp + buildUniqueBackupPath) so the marker's name
+  // matches the artifact it stands in for. Cleared on success, converted to
+  // a `.failed` marker (with the truncated error) if the job throws anywhere
+  // below — including inside withBackupLock, replication, or finalize.
+  const startedAt = resolved.runtime.now();
+  const predicted = buildUniqueBackupPath({
+    engine: detectDatabaseEngine(resolved.databaseUrl),
+    timestamp: formatTimestamp(startedAt),
+    outputDir: resolved.outputDir,
+    compressSqlite: resolved.compressSqlite,
+    namePrefix: resolved.namePrefix,
   });
+  writeInProgressMarker(resolved.outputDir, predicted.fileName, startedAt);
+
+  try {
+    const result = withBackupLock(resolved.outputDir, resolved.runtime, () => {
+      // createBackup re-derives via resolveBackupOptions; `destinations` is
+      // already fully resolved here, so pass skipRemote:false to avoid it
+      // reading as a second, conflicting location model on re-entry.
+      const created = createBackup({ ...resolved, skipRemote: false });
+      const now = resolved.runtime.now();
+
+      warnIfLocalOnly(resolved, remoteDestinations);
+
+      // Replicate off-host BEFORE anything is pruned or stamped. A local-only
+      // backup dies with the disk it sits on; an unverified remote copy is not
+      // a backup. If any upload or its verification fails we throw here, so
+      // the previous good backups and the previous stamp both survive
+      // untouched at every destination, local included.
+      const distributions = remoteDestinations.map((destination) => ({
+        destination,
+        uploaded: uploadBackupToRemote(created, destination, resolved.runtime),
+        removed: [],
+      }));
+
+      // Retention is applied per destination only after EVERY destination has
+      // a verified copy — a prune must never run ahead of replication. The
+      // SAME policy drives every destination once a GFS policy is configured
+      // (resolveDestinationPolicy); otherwise each keeps its legacy count.
+      for (const distribution of distributions) {
+        const policy = resolveDestinationPolicy(distribution.destination, resolved);
+        distribution.removed = pruneRemoteBackups(
+          distribution.destination,
+          created.fileName,
+          resolved.runtime,
+          resolved.namePrefix,
+          policy,
+          now,
+        );
+      }
+
+      return finalizeBackupResult(resolved, created, now, distributions);
+    });
+    clearInProgressMarker(resolved.outputDir, predicted.fileName);
+    return result;
+  } catch (error) {
+    failInProgressMarker(resolved.outputDir, predicted.fileName, startedAt, error);
+    // Exposed so a caller that treats this particular failure as a deliberate
+    // no-op (runCli's --allow-missing skip on a fresh install) can remove the
+    // marker it didn't want written — see runCli below.
+    error.markerPath = backupMarkerPath(resolved.outputDir, predicted.fileName, MARKER_SUFFIXES.failed);
+    throw error;
+  }
 }
 
 // Async backup job — the correct entry point for any in-process/library
@@ -3078,57 +3335,80 @@ async function runBackupJobAsync(options = {}) {
 
   ensureBackupDir(resolved.outputDir);
 
-  return withBackupLockAsync(resolved.outputDir, resolved.runtime, async () => {
-    // createBackup re-derives via resolveBackupOptions; `destinations` is
-    // already fully resolved here, so pass skipRemote:false to avoid it
-    // reading as a second, conflicting location model on re-entry.
-    const created = createBackup({ ...resolved, skipRemote: false });
-    const now = resolved.runtime.now();
-
-    const remoteDestinations = resolved.destinations.filter((dest) => dest.type !== 'local');
-    warnIfLocalOnly(resolved, remoteDestinations);
-
-    // Replicate off-host BEFORE anything is pruned or stamped — see
-    // runBackupJob for the full rationale. Uploads run in order (not
-    // parallel) so a failure on destination N leaves destinations after it
-    // untouched, and the ones before it already verified.
-    const distributions = [];
-    for (const destination of remoteDestinations) {
-      const uploaded =
-        destination.type === 's3'
-          ? await uploadBackupToS3(created, destination, resolved.runtime)
-          : uploadBackupToRemote(created, destination, resolved.runtime);
-      distributions.push({ destination, uploaded, removed: [] });
-    }
-
-    // Retention is applied per destination only after EVERY destination has
-    // a verified copy — a prune must never run ahead of replication.
-    for (const distribution of distributions) {
-      const policy = resolveDestinationPolicy(distribution.destination, resolved);
-      distribution.removed =
-        distribution.destination.type === 's3'
-          ? await pruneS3Backups(
-              distribution.destination,
-              created.fileName,
-              resolved.runtime,
-              resolved.namePrefix,
-              parseBackupFileName,
-              planRetention,
-              policy,
-              now,
-            )
-          : pruneRemoteBackups(
-              distribution.destination,
-              created.fileName,
-              resolved.runtime,
-              resolved.namePrefix,
-              policy,
-              now,
-            );
-    }
-
-    return finalizeBackupResult(resolved, created, now, distributions);
+  // Lifecycle marker — see runBackupJob for the full rationale; identical
+  // predict/write/clear/fail sequence, just awaited.
+  const startedAt = resolved.runtime.now();
+  const predicted = buildUniqueBackupPath({
+    engine: detectDatabaseEngine(resolved.databaseUrl),
+    timestamp: formatTimestamp(startedAt),
+    outputDir: resolved.outputDir,
+    compressSqlite: resolved.compressSqlite,
+    namePrefix: resolved.namePrefix,
   });
+  writeInProgressMarker(resolved.outputDir, predicted.fileName, startedAt);
+
+  try {
+    const result = await withBackupLockAsync(resolved.outputDir, resolved.runtime, async () => {
+      // createBackup re-derives via resolveBackupOptions; `destinations` is
+      // already fully resolved here, so pass skipRemote:false to avoid it
+      // reading as a second, conflicting location model on re-entry.
+      const created = createBackup({ ...resolved, skipRemote: false });
+      const now = resolved.runtime.now();
+
+      const remoteDestinations = resolved.destinations.filter((dest) => dest.type !== 'local');
+      warnIfLocalOnly(resolved, remoteDestinations);
+
+      // Replicate off-host BEFORE anything is pruned or stamped — see
+      // runBackupJob for the full rationale. Uploads run in order (not
+      // parallel) so a failure on destination N leaves destinations after it
+      // untouched, and the ones before it already verified.
+      const distributions = [];
+      for (const destination of remoteDestinations) {
+        const uploaded =
+          destination.type === 's3'
+            ? await uploadBackupToS3(created, destination, resolved.runtime)
+            : uploadBackupToRemote(created, destination, resolved.runtime);
+        distributions.push({ destination, uploaded, removed: [] });
+      }
+
+      // Retention is applied per destination only after EVERY destination has
+      // a verified copy — a prune must never run ahead of replication.
+      for (const distribution of distributions) {
+        const policy = resolveDestinationPolicy(distribution.destination, resolved);
+        distribution.removed =
+          distribution.destination.type === 's3'
+            ? await pruneS3Backups(
+                distribution.destination,
+                created.fileName,
+                resolved.runtime,
+                resolved.namePrefix,
+                parseBackupFileName,
+                planRetention,
+                policy,
+                now,
+              )
+            : pruneRemoteBackups(
+                distribution.destination,
+                created.fileName,
+                resolved.runtime,
+                resolved.namePrefix,
+                policy,
+                now,
+              );
+      }
+
+      return finalizeBackupResult(resolved, created, now, distributions);
+    });
+    clearInProgressMarker(resolved.outputDir, predicted.fileName);
+    return result;
+  } catch (error) {
+    failInProgressMarker(resolved.outputDir, predicted.fileName, startedAt, error);
+    // Exposed so a caller that treats this particular failure as a deliberate
+    // no-op (runCli's --allow-missing skip on a fresh install) can remove the
+    // marker it didn't want written — see runCli below.
+    error.markerPath = backupMarkerPath(resolved.outputDir, predicted.fileName, MARKER_SUFFIXES.failed);
+    throw error;
+  }
 }
 
 function buildDailyCronEntry({
@@ -3600,6 +3880,13 @@ async function runCli(argv = process.argv.slice(2)) {
       error instanceof Error &&
       /^SQLite database file not found:/.test(error.message)
     ) {
+      // A deliberate no-op skip, not a real failure — remove the `.failed`
+      // marker runBackupJobAsync just wrote so an admin surface doesn't
+      // report a "backup failed" incident for an expected fresh-install
+      // condition (see the `markerPath` this error carries).
+      if (error.markerPath) {
+        fs.rmSync(error.markerPath, { force: true });
+      }
       const skipped = { skipped: true, reason: error.message, mode: baseOptions.mode };
       if (options.json) {
         console.log(JSON.stringify(skipped, null, 2));
@@ -3665,6 +3952,8 @@ module.exports = {
   readSuccessStamp,
   checkBackupFreshness,
   checkRemoteFreshness,
+  getOperationalStatus,
+  listBackupMarkers,
   notifyAlert,
   uploadBackupToRemote,
   pruneRemoteBackups,
