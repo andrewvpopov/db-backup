@@ -154,6 +154,19 @@ export interface BackupFreshness {
   maxAgeHours: number;
 }
 
+/** Lifecycle state of a `BackupEntry`. `'completed'` is any entry backed by a
+ * real on-disk artifact (the only state that existed before this field was
+ * added). `'running'`/`'failed'` back a job's lifecycle marker instead —
+ * `<prefix>-<startedAt>-<jobId>.inprogress` / `.failed`, named by JOB
+ * IDENTITY, never by the artifact the job might have produced (see
+ * {@link listBackupMarkers}). `'running'` means a job started and is not
+ * known to have finished — in flight, or the process died without reaching
+ * its failure handler. Markers carry no size requirement and are always
+ * excluded from retention SELECTION (planRetention never sees them); a stale
+ * `'failed'` marker can still appear in a `BackupPlan.remove` for cleanup —
+ * see `listBackupsWithPlan`. */
+export type BackupEntryState = 'completed' | 'running' | 'failed';
+
 export interface BackupEntry {
   fileName: string;
   /** The filename prefix this backup was written under. */
@@ -163,6 +176,21 @@ export interface BackupEntry {
   compressed: boolean;
   /** True when the artifact is gpg-encrypted (`.gpg` suffix). */
   encrypted?: boolean;
+  /** Defaults to `'completed'` for every entry backed by a real artifact.
+   * `'running'`/`'failed'` only appear on marker-derived rows (see
+   * {@link listBackupMarkers}), which is only ever true for the newest
+   * entries surfaced by `listBackupsWithPlan`/`getOperationalStatus`. */
+  state?: BackupEntryState;
+  /** `'failed'` marker rows only: the truncated error message from the run
+   * that failed (see `MARKER_ERROR_TRUNCATE_LENGTH` in the implementation). */
+  error?: string;
+  /** Marker rows only: ISO time the job started. */
+  startedAt?: string;
+  /** `'failed'` marker rows only: ISO time the job failed — a job can fail
+   * long after it started, and the failure's recency (not the start's) is
+   * what freshness/eviction logic compares against. Doubles as the row's
+   * `createdAt`. */
+  failedAt?: string;
   createdAt: string;
   sizeBytes: number;
   ageDays?: number;
@@ -654,6 +682,55 @@ export function checkRemoteFreshness(options: {
    * backup job's `--name-prefix`). Default: the canonical sqlite/postgres names. */
   namePrefix?: string | null;
 }): BackupFreshness;
+
+/** Surfaces every `<prefix>-<startedAt>-<jobId>.inprogress` / `.failed`
+ * lifecycle marker in `outputDir` as a `BackupEntry`-shaped row
+ * (`state: 'running' | 'failed'`), newest first — a `'failed'` row is ranked
+ * by its `failedAt`, a `'running'` row by its `startedAt`. `sizeBytes` is
+ * always 0 — markers are not backups and carry no size requirement.
+ * `'failed'` rows carry the truncated `error` message and `failedAt`.
+ * See the implementation's lifecycle-marker doc comment for the on-disk
+ * marker format and the stale-marker cleanup rules (including the two
+ * evidence-preservation exemptions). */
+export function listBackupMarkers(
+  outputDir: string,
+  now?: Date,
+  namePrefix?: string | null,
+): BackupEntry[];
+
+export interface OperationalStatus {
+  tone: 'healthy' | 'warning' | 'critical';
+  detail: string;
+  /** ISO timestamp of the last successful backup, when known. */
+  stampedAt?: string;
+}
+
+/** Admin-surface feed: combines {@link checkBackupFreshness} with the
+ * lifecycle markers in `outputDir` (see {@link listBackupMarkers}) into one
+ * `OperationalStatus`, the natural input for admin-kit's
+ * `AdminOperationalStatus`.
+ *
+ * Precedence, most to least urgent:
+ *   1. Any `'failed'` marker whose `failedAt` is newer than the newest
+ *      COMPLETED backup's `createdAt` (or any failed marker at all when no
+ *      completed backup exists) -> `'critical'`. A failed run beats a fresh
+ *      stamp — the stamp only proves a PAST success. The comparison is
+ *      failedAt-vs-artifact, not "is the newest row a failure": a run that
+ *      fails AFTER creating its artifact (replication/finalize) must not be
+ *      masked by that artifact's newer-looking createdAt.
+ *   2. The stamp is dated in the future (clock skew) -> `'warning'`.
+ *   3. The stamp is stale (not fresh, no clock skew) -> `'critical'`.
+ *   4. Otherwise -> `'healthy'`.
+ */
+export function getOperationalStatus(options: {
+  stampFile: string;
+  /** When provided, failed markers in this directory are compared against
+   * the newest completed backup for the precedence rule above. */
+  outputDir?: string;
+  maxAgeHours?: number;
+  now?: Date;
+  namePrefix?: string | null;
+}): OperationalStatus;
 
 /** Best-effort alert delivery for the `freshness` command. NEVER throws and
  * NEVER changes the exit code. Synchronous (POSTs via curl / runs a command),

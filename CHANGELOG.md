@@ -11,6 +11,53 @@ silently break restore correlation. `backupId` is the documented, stable
 contract for that use case; see the new "Machine-readable output" README
 section. Additive only — all existing fields are unchanged.
 
+**Lifecycle/freshness surfaces for admin composition (PKG-28).** Every
+`BackupEntry` now carries a `state`: `'completed'` for a real on-disk
+artifact (unchanged behavior), plus two new states backed by lightweight
+markers so an in-flight or crashed job is representable at all:
+
+- `'running'` — a `.inprogress` marker, written the instant a job starts and
+  removed the instant it finishes successfully. Means "started and not known
+  to have finished" (in flight, or the process died before its failure
+  handler ran).
+- `'failed'` — a `.failed` marker (the `.inprogress` marker renamed in
+  place), holding `{ startedAt, failedAt, error }` with the error message
+  truncated so a huge stack trace can't bloat the backup directory.
+
+Markers are named by job identity — `<prefix>-<startedAt>-<jobId>` — never by
+a predicted artifact filename (the artifact's name is unknowable up front:
+lock waits cross timestamp seconds, encryption appends `.gpg`, the collision
+allocator bumps sequences). Markers carry no size requirement and are always
+excluded from retention **selection** (`planRetention` never sees them). A
+stale `.failed` marker — older than the oldest backup the policy is still
+keeping — is folded into the removal plan by
+`listBackupsWithPlan`/`pruneBackupsJob` for cleanup (`retentionReason:
+'stale_marker'`), with two evidence-preservation exemptions: when the plan
+keeps no backups at all, no failed marker is ever stale, and the newest
+failed marker is always retained regardless of age. A `.inprogress` marker is
+never swept. New export `listBackupMarkers(outputDir, now?, namePrefix?)`
+surfaces markers directly as `BackupEntry`-shaped rows (failed rows ranked by
+`failedAt`).
+
+New export `getOperationalStatus({ stampFile, outputDir?, maxAgeHours?, now?,
+namePrefix? })` combines `checkBackupFreshness` with the lifecycle markers
+into `{ tone: 'healthy' | 'warning' | 'critical', detail, stampedAt? }` — the
+natural feed for admin-kit's `AdminOperationalStatus`. Precedence: any failed
+marker whose `failedAt` is newer than the newest completed backup (critical —
+so a run that fails after creating its artifact is never masked by that
+artifact) > clock skew (warning) > stale (critical) > healthy. See the new
+README "Backup lifecycle states and markers" / "Operational status (admin
+surfaces)" sections.
+
+Additive only — every existing `BackupEntry` consumer is unaffected; `state`
+and `error` are new optional fields.
+
+Also: the `__tests__` suite (previously one ~3,700-line file) is now split
+into per-area files (`backup-job`, `retention`, `restore`, `cli`,
+`destinations-replication`, `freshness`, `encryption`) sharing fixtures via
+`__tests__/helpers.ts`. No test logic changed; same tests, same assertions,
+now organized by area, plus new coverage for the surfaces above.
+
 ## 0.17.2
 
 - Add public contribution, support, and private vulnerability-reporting policies.
